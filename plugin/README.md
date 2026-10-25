@@ -2,6 +2,10 @@
 
 DeepSeek Harness 插件：**给 Agent 一副嗓子。**
 
+> 本插件的 OpenAI 兼容 TTS 客户端契约、语言处理、同源媒体交付和验证方法来自
+> [Code-Amadeus/Amadeus](https://github.com/Code-Amadeus/Amadeus) 的开源工作，特此致谢。
+> 本仓库包含其衍生代码，整体按 AGPL-3.0 发布。
+
 它把 [Amadeus](https://github.com/Code-Amadeus/Amadeus) 的 OpenAI 兼容 TTS 客户端契约抽出来，做成一个独立的 npm bundle。默认配置面向 GPT-SoVITS 网关，但连接层也支持任意 OpenAI 兼容或自定义 speech/health 端点，并提供一个**专门的对话型 agent 预设**——中文作答，每次回应都合成成语音，附同源播放地址。
 
 ---

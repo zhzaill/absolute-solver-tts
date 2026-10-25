@@ -7,6 +7,10 @@ Absolute Solver TTS combines:
   in the Amadeus project;
 - deployment and verification notes produced during the Absolute Solver project.
 
+The Amadeus project is the upstream design and implementation lineage for the DSH
+TTS client. We gratefully acknowledge its maintainers and contributors:
+https://github.com/Code-Amadeus/Amadeus
+
 Amadeus is distributed under the GNU Affero General Public License v3. This repository
 is therefore distributed under AGPL-3.0. See `LICENSE` and `THIRD_PARTY_NOTICES.md`.
 

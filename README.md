@@ -2,6 +2,11 @@
 
 一个可直接部署的 GPT-SoVITS OpenAI 兼容语音服务，以及配套的 DeepSeek Harness（DSH）插件。
 
+> **来源与致谢：**本项目的 DSH TTS 客户端、语言损失分析、同源音频交付与验证方法基于
+> [Code-Amadeus/Amadeus](https://github.com/Code-Amadeus/Amadeus) 的开源工作。仓库包含
+> Amadeus 衍生代码，因此整体采用 AGPL-3.0。详见 [CREDITS.md](CREDITS.md) 与
+> [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。Amadeus 是独立项目，与本仓库没有隶属或背书关系。
+
 它解决的不是“能不能合成音频”，而是语音链路里三个容易被误判为成功的问题：
 
 1. OpenAI `/v1/audio/speech` 协议没有文本语言字段，日文可能被中文前端静默读错。
@@ -252,6 +257,7 @@ Invoke-WebRequest `
 - [部署](docs/deployment.md)
 - [故障排查](docs/troubleshooting.md)
 - [历史与实测结论](docs/history.md)
+- [致谢与来源](CREDITS.md)
 - [资产与许可](docs/assets-and-licenses.md)
 
 ## 许可

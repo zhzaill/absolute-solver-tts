@@ -19,6 +19,11 @@ parts of the client implementation were derived from or adapted from the Amadeus
 project, which is distributed under AGPL-3.0. This repository is distributed under
 AGPL-3.0 as a whole.
 
+Upstream project: https://github.com/Code-Amadeus/Amadeus
+
+The Amadeus maintainers and contributors are acknowledged in `CREDITS.md`. Their
+project is independent and does not endorse this repository.
+
 ## OpenAI audio API
 
 The gateway implements a compatible subset of the OpenAI audio speech API shape.

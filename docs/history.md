@@ -3,6 +3,18 @@
 This is a sanitized technical history. Personal paths, hosts, credentials, private
 logs, and third-party voice assets are intentionally excluded.
 
+## Lineage
+
+The DSH TTS client is adapted from the OpenAI-compatible TTS work in
+[Code-Amadeus/Amadeus](https://github.com/Code-Amadeus/Amadeus). That lineage
+includes the buffered WAV/SSE client contract, explicit language handling, the
+same-origin audio design, and the practice of checking spoken content rather than
+trusting file size alone.
+
+Because this repository includes modified Amadeus-derived code, it is licensed
+under AGPL-3.0. See `CREDITS.md` for the acknowledgement and `LICENSE` for the
+full terms.
+
 ## Why the gateway exists
 
 GPT-SoVITS' native API requires a reference audio path and transcript on each

@@ -13,6 +13,12 @@ This repository does not distribute:
 The repository cannot grant rights to a voice, a performance, a recording, or a
 character likeness. Those rights are independent of the software license.
 
+Extracting a voice from published media yourself does not create a right to
+redistribute the resulting model, embeddings, or recordings. A "non-commercial"
+label is a usage preference, not a license from the rightsholders. This repository
+therefore does not host such a model or designate a third-party character voice as
+its default.
+
 ## Bring your own voice
 
 You may connect a voice only if you have the necessary rights and permissions.

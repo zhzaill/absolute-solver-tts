@@ -50,6 +50,13 @@ check('package.json declares the bundle patch', () => {
 
 check('the patch file is shipped', () => assert.ok(existsSync(path.join(installed, 'cordis.patch.yml'))));
 
+check('license and upstream attribution are shipped', () => {
+  assert.ok(existsSync(path.join(installed, 'LICENSE')), 'LICENSE missing');
+  const notice = readFileSync(path.join(installed, 'NOTICE.md'), 'utf8');
+  assert.ok(notice.includes('Code-Amadeus/Amadeus'), 'Amadeus attribution missing');
+  assert.ok(notice.includes('AGPL-3.0'), 'AGPL notice missing');
+});
+
 // `references/host-plugin.md` requires display metadata to live in the locale
 // files and the icon to be a top-level manifest field, so the plugin manager can
 // render a card without activating the plugin.
