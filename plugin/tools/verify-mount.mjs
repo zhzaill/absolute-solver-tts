@@ -205,6 +205,7 @@ check('tts_speak has a well-formed definition', () => {
   assert.ok(tool.parameters.properties.text, 'text parameter missing');
   assert.deepEqual(tool.parameters.required, ['text']);
   assert.equal(typeof tool.output.render, 'function');
+  assert.equal(typeof tool.output.presentationMeta, 'function');
   assert.ok(Number.isFinite(tool.timeoutMs) && tool.timeoutMs > 0, 'timeoutMs must be a positive number');
 });
 
@@ -360,7 +361,8 @@ await checkAsync('tts_speak synthesizes a Chinese sentence', async () => {
   assert.equal(result.ok, true, `tool reported failure: ${JSON.stringify(result)}`);
   assert.equal(result.language, 'zh', `expected zh, got ${result.language}`);
   assert.ok(result.bytes > 1000, `too few bytes: ${result.bytes}`);
-  assert.ok(result.url.startsWith('/dsh-tts/audio?id='), `unexpected url: ${result.url}`);
+  assert.equal(result.url, `http://127.0.0.1:19387/dsh-tts/audio?id=${result.id}`);
+  assert.equal(result.path, `/dsh-tts/audio?id=${result.id}`);
   log.push(`        ${result.characters} chars -> ${result.bytes} bytes, `
     + `${result.durationSeconds.toFixed(2)}s @ ${result.sampleRate} Hz, lang=${result.language} (${result.languageReason})`);
 });
@@ -370,6 +372,11 @@ await checkAsync('the tool\'s own render() explains the result', () => {
   const text = parts.map((part) => part.text).join('\n');
   assert.ok(text.includes('zh'), 'render does not mention the language');
   assert.ok(text.includes(result.url), 'render does not include the url');
+  assert.ok(text.includes(result.path), 'render does not include the relative path');
+  const meta = speak.output.presentationMeta({}, result);
+  assert.equal(meta.url, result.path, 'tool view meta must use the same-origin path');
+  assert.equal(meta.absoluteUrl, result.url);
+  assert.equal(meta.language, result.language);
 });
 
 await checkAsync('every result the tool can return is lossless JSON', async () => {
@@ -387,7 +394,7 @@ await checkAsync('every result the tool can return is lossless JSON', async () =
 
 let fetched;
 await checkAsync('the audio is retrievable from this origin', async () => {
-  const response = await fetch(origin + result.url);
+  const response = await fetch(origin + result.path);
   assert.equal(response.status, 200, `HTTP ${response.status}`);
   assert.equal(response.headers.get('content-type'), 'audio/wav');
   fetched = Buffer.from(await response.arrayBuffer());

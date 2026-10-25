@@ -1,6 +1,6 @@
 {
   "name": "dsh-tts",
-  "version": "0.2.1",
+  "version": "0.2.5",
   "description": "DeepSeek Harness bundle: gives the agent a voice through an OpenAI-compatible or custom TTS endpoint, with provider-neutral URL/auth/header resolution, same-origin audio playback, explicit text-language declaration, and Chinese by default. Ported from Amadeus's openai_compatible TTS backend. / 让 DSH 的 Agent 有嗓子：支持 OpenAI 兼容及自定义 TTS 端点、通用连接解析、同源播放和显式文本语言，默认中文。",
   "type": "module",
   "private": true,

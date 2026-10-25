@@ -17,7 +17,10 @@ try {
         throw "Python tests failed"
     }
 
-    $javascriptFiles = @(Get-ChildItem -Path "plugin\bin", "plugin\lib", "plugin\tools" -Filter "*.mjs" -File)
+    $javascriptFiles = @(
+        Get-ChildItem -Path "plugin\bin", "plugin\lib", "plugin\tools" -Filter "*.mjs" -File
+        Get-ChildItem -Path "browser\lib", "tests\browser", "tests\support" -Filter "*.mjs" -File
+    )
     foreach ($file in $javascriptFiles) {
         node --check $file.FullName
         if ($LASTEXITCODE -ne 0) {
@@ -36,6 +39,10 @@ try {
     node plugin\tools\verify-install.mjs plugin
     if ($LASTEXITCODE -ne 0) {
         throw "Install verification failed"
+    }
+    node tests\browser\tool-view-smoke.mjs
+    if ($LASTEXITCODE -ne 0) {
+        throw "Browser playback verification failed"
     }
 
     if ($Live) {

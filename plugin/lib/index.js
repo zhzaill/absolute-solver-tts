@@ -30,6 +30,8 @@ export const inject = ['tools'];
 const DEFAULTS = {
   /** The GPT-SoVITS OpenAI-compatible gateway on the model server. */
   baseUrl: 'http://127.0.0.1:18080/v1',
+  /** Browser-facing Harness origin used to make returned audio links clickable. */
+  publicBaseUrl: 'http://127.0.0.1:19387',
   speechUrl: '',
   healthUrl: '',
   model: 'tts-1',
@@ -92,6 +94,9 @@ export function resolveConfig(entryConfig = {}) {
       env.DSH_TTS_BASE_URL,
       DEFAULTS.baseUrl,
     )),
+    publicBaseUrl: String(firstNonBlank(
+      entryConfig.publicBaseUrl, connection.publicBaseUrl, env.DSH_TTS_PUBLIC_BASE_URL, DEFAULTS.publicBaseUrl,
+    )).replace(/\/+$/, ''),
     speechUrl: String(first(
       entryConfig.speechUrl,
       connection.speechUrl,
@@ -169,6 +174,7 @@ export function createRuntime(config = resolveConfig()) {
   return {
     audio,
     audioBasePath: AUDIO_BASE_PATH,
+    audioUrl: (id) => `${config.publicBaseUrl}${AUDIO_BASE_PATH}?id=${encodeURIComponent(id)}`,
     getConfig: () => config,
     client: () => client,
 

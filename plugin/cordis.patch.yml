@@ -52,6 +52,7 @@
             name: 'dsh-tts'
             config:
               baseUrl: http://127.0.0.1:18080/v1
+              publicBaseUrl: http://127.0.0.1:19387
               model: tts-1
               voice: local_voice
               language: zh

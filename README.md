@@ -26,6 +26,12 @@ dsh-tts plugin
   - declares text language
   - buffers and validates WAV
   - serves audio from the DSH origin
+  - returns absolute URL + relative path
+        |
+        v
+DSH tool.call.toolview
+  - renders tts_speak results as native audio controls
+  - serializes multiple tool-card players
         |
         | localhost or SSH forward
         v
@@ -52,6 +58,7 @@ DSH 推荐把网关放在模型服务器上，通过 SSH 将远端 `127.0.0.1:18
 - 中文、日文、英文的显式语言声明
 - DSH 工具：`tts_speak`、`tts_status`
 - DSH 同源音频路由：`GET /dsh-tts/audio?id=...`
+- `tts_speak` 工具卡：原生音频控件、串行播放队列、错误状态
 - 内容哈希 LRU 缓存
 - 终端 CLI：状态检查、合成、播放、文件转写校验
 - 本机、局域网、SSH 隧道、反向代理子路径和自定义 speech URL 连接
@@ -73,6 +80,7 @@ DSH 推荐把网关放在模型服务器上，通过 SSH 将远端 `127.0.0.1:18
 
 ```text
 plugin/                 DSH bundle（零运行时依赖）
+browser/                根级 DSH 工具视图 bundle（无工具、无权限）
 gateway/                FastAPI OpenAI 兼容网关
 config/                 音色与插件配置模板
 scripts/                安装、隧道、注册、校验和测试脚本
@@ -121,11 +129,14 @@ notepad .\config\voices.local.json
 
 ```powershell
 .\scripts\install-plugin.ps1 `
-  -ProfileDirectory "$env:USERPROFILE\.dsh\profiles\desktop"
+  -ProfileDirectory "$env:USERPROFILE\.dsh\profiles\desktop" `
+  -Voice "local_voice"
 ```
 
 脚本会先备份 profile 的 `package.json` 与 lockfile，再安装 tarball。安装完成后重启 DSH，
-新建会话并选择“对话·有声”。
+脚本会安装 `dsh-tts` 工具插件和根级 `dsh-tts-browser` 工具视图。完成后重启 DSH，
+新建会话并选择“对话·有声”。`-Voice` 只写入本机已安装 bundle，不会改动仓库模板；
+部署到私有网关时可在命令行传入实际注册过的音色 ID。
 
 如果 DSH 提供 `plugin_manager.install_bundle`，优先使用其图形界面或官方安装流程。
 
@@ -239,14 +250,24 @@ Invoke-WebRequest `
 - Python 语法编译
 - 网关鉴权、路径逃逸、音色注册、语言推断和上游请求形状
 - DSH 工具 schema 与安装包结构
+- `tts_speak` 的 `tool.call.toolview` 注册与播放器渲染
 - 插件离线自检
 
 真实合成、播放和 ASR 往返属于部署验收，不作为 CI 的离线前提。
 
+浏览器工具视图的完整联调可在本机 DSH 开启回环 DevTools 端口后运行：
+
+```powershell
+node tests\support\fake_tts_gateway.mjs
+node tests\browser\dsh-live-smoke.mjs
+```
+
+第二个脚本会发送两段测试文本，并核对第一段 `ended` 早于第二段 `play`。
+
 ## 已知边界
 
 - 当前网关返回缓冲 WAV，未实现 OpenAI SSE 流式音频。
-- DSH 同源路由解决音频取回，但浏览器自动播放仍受用户交互策略限制。
+- DSH 同源路由解决音频取回；`tts_speak` 工具卡负责串行播放，但自动播放仍受用户交互策略限制。
 - 纯汉字文本可能无法区分中文和日文；需要调用方显式传入语言。
 - ASR 往返只能抓住句子级内容错误，不能可靠判断标点、同音词和自然度。
 - GPU 采样即使固定 seed 也可能出现最低有效位差异，不能做字节哈希相等的验收。

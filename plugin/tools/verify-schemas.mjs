@@ -216,6 +216,7 @@ const connection = {
 const runtime = {
   audio: { size: () => 0 },
   audioBasePath: '/dsh-tts/audio',
+  audioUrl: (id) => `http://127.0.0.1:19387/dsh-tts/audio?id=${id}`,
   getConfig: () => ({
     baseUrl: 'http://127.0.0.1:18080/v1', model: 'tts-1', voice: 'local_voice',
     language: 'zh', promptLanguage: 'zh', apiKey: '', timeoutMs: 120000, cacheEntries: 32,

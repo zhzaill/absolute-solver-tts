@@ -4,6 +4,8 @@
   config:
     # Origin, API root, path-prefixed API root, or a complete speech URL are all accepted.
     baseUrl: http://127.0.0.1:18080/v1
+    # Browser-facing DSH origin used when tts_speak returns an absolute playback URL.
+    publicBaseUrl: http://127.0.0.1:19387
     # speechUrl: https://provider.example/custom/speech?api-version=2026-01-01
     # healthUrl: https://provider.example/custom/health
     model: tts-1

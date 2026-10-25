@@ -24,7 +24,8 @@ function speakDefinition(runtime) {
   return {
     name: 'tts_speak',
     description:
-      'Synthesize speech from text through the configured TTS endpoint and return a same-origin URL for the audio. '
+      'Synthesize speech from text through the configured TTS endpoint and return an absolute audio URL and a '
+      + 'same-origin path. '
       + 'Chinese is the default language; the language is declared to the endpoint explicitly and inferred from the '
       + 'text when you omit it, because the OpenAI speech schema cannot carry it. The result reports which language '
       + 'was actually used and why, so a wrong guess is visible instead of silent.',
@@ -50,7 +51,8 @@ function speakDefinition(runtime) {
           ok: { type: 'boolean', description: 'False only when the request was rejected before synthesis.' },
           error: { type: 'string', description: 'Present when ok is false.' },
           id: { type: 'string', description: 'Content key of the retained audio.' },
-          url: { type: 'string', description: 'Same-origin path that serves the audio.' },
+          url: { type: 'string', description: 'Absolute Harness-origin URL that serves the audio and can be rendered as a link.' },
+          path: { type: 'string', description: 'Same-origin path that serves the audio; useful when the public origin changes.' },
           cached: { type: 'boolean', description: 'True when an identical earlier request was reused.' },
           characters: { type: 'integer' },
           bytes: { type: 'integer' },
@@ -69,12 +71,30 @@ function speakDefinition(runtime) {
           + ` using voice "${data.voice}".`,
           `Audio: ${data.durationSeconds.toFixed(2)} s, ${data.sampleRate} Hz, ${data.bytes} bytes`
           + `${data.cached ? ' (reused from cache)' : ''}.`,
-          `Same-origin URL: ${data.url}`,
+          `Audio URL: ${data.url}`,
+          `Same-origin path: ${data.path}`,
+          'The DSH tool card renders an audio player from this result. Do not repeat the URL in the final reply.',
         ];
         if (data.languageReason === 'inferred') {
           lines.push('The language was inferred, not declared: pass `language` explicitly if that guess is wrong.');
         }
         return [{ type: 'text', text: lines.join('\n') }];
+      },
+      presentationMeta(_args, value) {
+        const data = value;
+        return {
+          url: data.path,
+          absoluteUrl: data.url,
+          id: data.id,
+          cached: data.cached,
+          characters: data.characters,
+          bytes: data.bytes,
+          durationSeconds: data.durationSeconds,
+          sampleRate: data.sampleRate,
+          voice: data.voice,
+          language: data.language,
+          languageReason: data.languageReason,
+        };
       },
     },
     timeoutMs: 300_000,
@@ -100,11 +120,12 @@ function speakDefinition(runtime) {
         speed,
       });
 
-      const url = `${runtime.audioBasePath}?id=${result.id}`;
+      const path = `${runtime.audioBasePath}?id=${result.id}`;
       return {
         ok: true,
         id: result.id,
-        url,
+        url: runtime.audioUrl(result.id),
+        path,
         cached: result.cached,
         characters: text.length,
         bytes: result.bytes,

@@ -33,7 +33,7 @@ DeepSeek Harness 插件：**给 Agent 一副嗓子。**
 
 网关在 `127.0.0.1:18080`，Harness 的 Web 源在别处。浏览器的跨源请求会被拦，https 页面还会把它当成混合内容。所以音频必须**由 Harness 自己的源重新提供**——这就是 `dsh-comfyui` 里那个 "same-origin media proxy" 的同一件事。
 
-本插件的处理：起一条 `GET /dsh-tts/audio?id=<key>` 路由，按内容哈希从内存里取音频回吐，返回**相对路径**（因此不受源地址变化影响）。
+本插件的处理：起一条 `GET /dsh-tts/audio?id=<key>` 路由，按内容哈希从内存里取音频回吐。`tts_speak` 的 `presentationMeta` 把同源路径交给 DSH 工具卡，工具卡直接渲染原生播放器。
 
 ### 三、"说错了"与"说不出来"长得一样
 
@@ -235,6 +235,7 @@ GPT-SoVITS 这类引擎是**采样**的：同一个 seed 默认是 `-1`（随机
 | 配置键 | 环境变量 | 默认 |
 |---|---|---|
 | `baseUrl` | `DSH_TTS_BASE_URL` | `http://127.0.0.1:18080/v1` |
+| `publicBaseUrl` | `DSH_TTS_PUBLIC_BASE_URL` | `http://127.0.0.1:19387` |
 | `speechUrl` | `DSH_TTS_SPEECH_URL` | 空，按 `baseUrl` 推导 |
 | `healthUrl` | `DSH_TTS_HEALTH_URL` | 空，自动探测 |
 | `model` | `DSH_TTS_MODEL` | `tts-1` |
@@ -276,7 +277,7 @@ node tools/verify-connection.mjs
 
 ## 已知边界
 
-- **播放需要一次点击。** 工具返回同源地址，但插件没有客户端组件，不能自动播放。要自动播需要再写一个 web 客户端插件去接这个地址。
+- **浏览器播放需要一次点击或允许自动播放。** `tts_speak` 工具卡通过 `tool.call.toolview` 渲染原生 `<audio>`，按到达顺序串行播放多段语音，浏览器拦截自动播放时保留控件供用户点击。
 - **SSE 流式已实现但未启用。** `TTSClient.synthesizeStream` 完整实现了 `speech.audio.delta` / `speech.audio.done` / `[DONE]` 协议并保留 Amadeus 的 80 ms 分块规则，但当前后端网关只提供 buffered WAV，所以工具走的是 buffered 路径。网关侧支持 SSE 后即可切换。
 - **SSE 采样率是硬编码的 24 kHz**（`OPENAI_PCM_SAMPLE_RATE`），因为协议里没有采样率字段。GPT-SoVITS 常见输出为 **32 kHz**——实现 SSE 端点时必须重采样到 24 kHz，否则播放会变速变调。
 - **语言推断在纯汉字文本上会判成 `zh`。** `今日無事完了` 没有假名，字形上就是汉字。这是字形检测的原理性边界，不是缺陷；需要时由调用方显式给 `language`。

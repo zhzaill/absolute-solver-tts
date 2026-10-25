@@ -75,7 +75,19 @@ It contributes:
 - A voice contract in the system prompt.
 
 The browser cannot treat a direct fetch to the gateway as same-origin. The plugin
-stores the WAV under a content hash and returns a relative same-origin URL instead.
+stores the WAV under a content hash and returns both an absolute browser URL and a
+relative same-origin path.
+
+### Browser tool view
+
+The root-level `dsh-tts-browser` bundle follows the same DSH extension point used by `dsh-comfyui`:
+`ctx.slots.inject("tool.call.toolview", ...)` with key `tts_speak`. The host
+attaches `presentationMeta` to the settled tool result; the client renders a
+React card containing a native `<audio controls>` element.
+
+This avoids scraping conversation DOM and does not depend on Markdown link
+rendering. Multiple cards share one client-side queue so sentence segments play
+in order instead of overlapping.
 
 Connection resolution is provider-neutral:
 

@@ -98,7 +98,11 @@ arguments rather than silently speaking them.
 The plugin returns a DSH same-origin URL. Direct gateway URLs may be blocked by CORS
 or mixed-content policy. Confirm the plugin's `/dsh-tts/audio` route is mounted.
 
-Automatic playback can still be blocked by the browser's user-activation policy.
+The interactive player is registered by the root-level `dsh-tts-browser` bundle through
+`tool.call.toolview` for key `tts_speak`, using the result's `presentationMeta`.
+It does not depend on Markdown links or conversation DOM scanning.
+Automatic playback can still be blocked by the browser's user-activation policy;
+the native controls remain available for a click.
 
 ## Streaming implementation plays too fast or slow
 
