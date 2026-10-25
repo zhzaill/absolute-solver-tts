@@ -118,17 +118,23 @@ function skip(label, reason) {
   console.log(`  skip  ${label} — ${reason}`);
 }
 
-async function upstreamReachable(baseUrl) {
-  try {
-    const root = baseUrl.replace(/\/v1\/?$/, '');
-    const response = await fetch(`${root}/healthz`, { signal: AbortSignal.timeout(5000) });
-    return response.ok;
-  } catch {
-    return false;
-  }
-}
-
-const LIVE = await upstreamReachable(config.baseUrl);
+const client = new TTSClient({
+  baseUrl: config.baseUrl,
+  speechUrl: config.speechUrl,
+  healthUrl: config.healthUrl,
+  apiKey: config.apiKey,
+  authHeader: config.authHeader,
+  authScheme: config.authScheme,
+  extraHeaders: config.extraHeaders,
+  extraBody: config.extraBody,
+  model: config.model,
+  voice: config.voice,
+  timeoutMs: config.timeoutMs,
+  language: config.language,
+  promptLanguage: config.promptLanguage,
+});
+const health = await client.health();
+const LIVE = health.ok || health.reachable;
 if (!LIVE) {
   console.log('');
   console.log(`  note  upstream unreachable at ${config.baseUrl}`);
@@ -136,20 +142,10 @@ if (!LIVE) {
   console.log('');
 }
 
-const client = new TTSClient({
-  baseUrl: config.baseUrl,
-  apiKey: config.apiKey,
-  model: config.model,
-  voice: config.voice,
-  timeoutMs: config.timeoutMs,
-  language: config.language,
-  promptLanguage: config.promptLanguage,
-});
-
 if (LIVE) {
   await checkAsync('endpoint is reachable', async () => {
     const health = await client.health();
-    assert.equal(health.ok, true, `health probe failed: ${JSON.stringify(health)}`);
+    assert.equal(health.reachable, true, `health probe failed: ${JSON.stringify(health)}`);
   });
 
   await checkAsync('Chinese synthesis returns a valid WAV', async () => {

@@ -2,7 +2,7 @@
 
 DeepSeek Harness 插件：**给 Agent 一副嗓子。**
 
-它把 [Amadeus](https://github.com/Code-Amadeus/Amadeus) 的 OpenAI 兼容 TTS 客户端契约抽出来，做成一个独立的 npm bundle，指向服务器上的 GPT-SoVITS 网关，并提供一个**专门的对话型 agent 预设**——中文作答，每次回应都合成成语音，附同源播放地址。
+它把 [Amadeus](https://github.com/Code-Amadeus/Amadeus) 的 OpenAI 兼容 TTS 客户端契约抽出来，做成一个独立的 npm bundle。默认配置面向 GPT-SoVITS 网关，但连接层也支持任意 OpenAI 兼容或自定义 speech/health 端点，并提供一个**专门的对话型 agent 预设**——中文作答，每次回应都合成成语音，附同源播放地址。
 
 ---
 
@@ -231,15 +231,29 @@ GPT-SoVITS 这类引擎是**采样**的：同一个 seed 默认是 `-1`（随机
 | 配置键 | 环境变量 | 默认 |
 |---|---|---|
 | `baseUrl` | `DSH_TTS_BASE_URL` | `http://127.0.0.1:18080/v1` |
+| `speechUrl` | `DSH_TTS_SPEECH_URL` | 空，按 `baseUrl` 推导 |
+| `healthUrl` | `DSH_TTS_HEALTH_URL` | 空，自动探测 |
 | `model` | `DSH_TTS_MODEL` | `tts-1` |
 | `voice` | `DSH_TTS_VOICE` | `local_voice` |
 | `language` | `DSH_TTS_LANGUAGE` | `zh` |
 | `promptLanguage` | `DSH_TTS_PROMPT_LANGUAGE` | `zh`（参考音频的语言） |
 | `apiKey` | `DSH_TTS_API_KEY` | 空 |
+| `authHeader` | `DSH_TTS_AUTH_HEADER` | `Authorization` |
+| `authScheme` | `DSH_TTS_AUTH_SCHEME` | `Bearer`，置空表示裸 key |
+| `extraHeaders` | `DSH_TTS_EXTRA_HEADERS` | `{}` 或 JSON |
+| `extraBody` | `DSH_TTS_EXTRA_BODY` | `{}` 或 JSON |
 | `timeoutMs` | `DSH_TTS_TIMEOUT_MS` | `120000` |
 | `cacheEntries` | `DSH_TTS_CACHE_ENTRIES` | `32` |
 
 `promptLanguage` 是**参考音频**的语言，与要合成的文本语言是两个独立的轴。中文参考 + 日文文本 = 用那把嗓子说日文，这是正确的跨语种配对，不是矛盾。
+
+连接层支持 origin、`/v1` API 根、反向代理子路径和完整 speech URL。路由不符合
+OpenAI 约定时设置 `speechUrl`；健康检查路径不同则设置 `healthUrl`。认证头可通过
+`authHeader`/`authScheme` 改为 `api-key` 或裸 token。状态接口只报告连接元数据，
+不会回显 key，也不会输出未遮蔽的敏感查询参数。
+
+也可以在 `config` 内使用 `connection` 分组承载这些字段；顶层的 `baseUrl` 等旧写法继续有效。
+`gatewayUrl` 是 `baseUrl` 的兼容别名。
 
 ---
 
@@ -249,6 +263,7 @@ GPT-SoVITS 这类引擎是**采样**的：同一个 seed 默认是 `-1`（随机
 
 ```powershell
 node tools/selftest.mjs
+node tools/verify-connection.mjs
 ```
 
 它检查语言归一、字形检测、决策优先级（含"中文文本不该被默认语言带走"）、端点拼接、LRU 与键稳定性，并**真的打一次网关**验证能拿到合法 WAV、以及载荷里确实带了 `text_lang`。

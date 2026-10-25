@@ -17,6 +17,17 @@
  */
 
 import { resolveSynthesisLanguage } from './lang.js';
+import { TTSError } from './errors.js';
+import {
+  connectionHeaders,
+  describeConnection,
+  healthEndpoints,
+  redactUrl,
+  resolveConnection,
+  speechEndpoint,
+} from './connection.js';
+
+export { TTSError, healthEndpoints, speechEndpoint };
 
 /** Matches Amadeus's `_MAX_SPEECH_RESPONSE_BYTES`. */
 export const MAX_SPEECH_BYTES = 64 * 1024 * 1024;
@@ -46,20 +57,6 @@ export function describeTransportError(error) {
   visit(error);
   const unique = [...new Set(codes.filter(Boolean))];
   return unique.length > 0 ? unique.join(', ') : (error?.message ?? String(error));
-}
-
-export class TTSError extends Error {
-  constructor(message, options) {
-    super(message, options);
-    this.name = 'TTSError';
-  }
-}
-
-/** Join a base URL with the speech endpoint without doubling `/audio/speech`. */
-export function speechEndpoint(baseUrl) {
-  const value = String(baseUrl ?? '').trim().replace(/\/+$/, '');
-  if (value === '') throw new TTSError('TTS base URL is empty');
-  return value.endsWith('/audio/speech') ? value : `${value}/audio/speech`;
 }
 
 /**
@@ -151,8 +148,9 @@ export class TTSClient {
    * @param {string} [config.promptLanguage] language of the reference audio the voice uses
    */
   constructor(config = {}) {
-    this.baseUrl = config.baseUrl ?? '';
-    this.apiKey = config.apiKey ?? '';
+    this.connection = resolveConnection(config);
+    this.baseUrl = this.connection.baseUrl;
+    this.apiKey = this.connection.apiKey;
     this.model = config.model ?? 'tts-1';
     this.voice = config.voice ?? '';
     this.timeoutMs = Number.isFinite(config.timeoutMs) ? config.timeoutMs : 120_000;
@@ -167,6 +165,7 @@ export class TTSClient {
       configured: this.language,
     });
     const payload = {
+      ...this.connection.extraBody,
       model: this.model,
       input: text,
       voice: voice ?? this.voice,
@@ -187,10 +186,7 @@ export class TTSClient {
   }
 
   #headers(streaming) {
-    const headers = { 'Content-Type': 'application/json; charset=utf-8' };
-    if (this.apiKey !== '') headers.Authorization = `Bearer ${this.apiKey}`;
-    if (streaming) headers.Accept = 'text/event-stream';
-    return headers;
+    return connectionHeaders(this.connection, { streaming });
   }
 
   #signal() {
@@ -213,7 +209,7 @@ export class TTSClient {
 
     let response;
     try {
-      response = await fetch(speechEndpoint(this.baseUrl), {
+      response = await fetch(this.connection.speechUrl, {
         method: 'POST',
         headers: this.#headers(false),
         body: JSON.stringify(payload),
@@ -225,7 +221,7 @@ export class TTSClient {
       // service and a wrong host look identical, which is exactly the kind of
       // undiagnosable message this whole exercise was about.
       throw new TTSError(
-        `TTS request failed: cannot reach ${speechEndpoint(this.baseUrl)}`
+        `TTS request failed: cannot reach ${redactUrl(this.connection.speechUrl)}`
         + ` (${describeTransportError(error)})`,
         { cause: error },
       );
@@ -266,7 +262,7 @@ export class TTSClient {
 
     let response;
     try {
-      response = await fetch(speechEndpoint(this.baseUrl), {
+      response = await fetch(this.connection.speechUrl, {
         method: 'POST',
         headers: this.#headers(true),
         body: JSON.stringify(payload),
@@ -319,13 +315,54 @@ export class TTSClient {
 
   /** Cheap liveness probe for the tool's error messages. */
   async health() {
-    const base = String(this.baseUrl ?? '').trim().replace(/\/+$/, '');
-    const candidate = base.endsWith('/v1') ? `${base.slice(0, -3)}/healthz` : `${base}/healthz`;
-    try {
-      const response = await fetch(candidate, { signal: AbortSignal.timeout(5000) });
-      return { ok: response.ok, status: response.status, url: candidate };
-    } catch (error) {
-      return { ok: false, status: 0, url: candidate, error: String(error?.message ?? error) };
+    const candidates = this.connection.healthUrls.length > 0
+      ? [...this.connection.healthUrls]
+      : healthEndpoints(this.connection);
+    const tried = [];
+    let last = null;
+    for (const candidate of candidates) {
+      try {
+        const response = await fetch(candidate, {
+          headers: connectionHeaders(this.connection, { json: false }),
+          signal: AbortSignal.timeout(5000),
+        });
+        tried.push({ url: redactUrl(candidate), status: response.status });
+        const result = {
+          ok: response.ok,
+          reachable: true,
+          status: response.status,
+          url: redactUrl(candidate),
+          tried,
+        };
+        if (response.ok) return result;
+        await response.body?.cancel().catch(() => {});
+        if (![404, 405].includes(response.status)) return result;
+        last = result;
+      } catch (error) {
+        const result = {
+          ok: false,
+          reachable: false,
+          status: 0,
+          url: redactUrl(candidate),
+          error: String(error?.message ?? error),
+          tried,
+        };
+        tried.push({ url: result.url, status: 0 });
+        last = result;
+      }
     }
+    return last ?? {
+      ok: false,
+      reachable: false,
+      status: 0,
+      url: redactUrl(this.connection.speechUrl),
+      error: 'no health candidate',
+      tried,
+    };
+  }
+
+  /** Redacted connection metadata safe for tools, routes and logs. */
+  describeConnection() {
+    return describeConnection(this.connection);
   }
 }

@@ -49,7 +49,8 @@ DSH 推荐把网关放在模型服务器上，通过 SSH 将远端 `127.0.0.1:18
 - DSH 同源音频路由：`GET /dsh-tts/audio?id=...`
 - 内容哈希 LRU 缓存
 - 终端 CLI：状态检查、合成、播放、文件转写校验
-- 本地或 SSH 隧道部署
+- 本机、局域网、SSH 隧道、反向代理子路径和自定义 speech URL 连接
+- 自定义鉴权头、静态请求头与 provider 附加 JSON 字段
 - 音色资产外置与提交前检查
 - 网关 API Key、管理接口鉴权和路径逃逸校验
 
@@ -152,6 +153,48 @@ node .\plugin\bin\tts.mjs --check
 ```
 
 如果没有 ASR，`--check` 会报告“未检查内容”，不会把“有音频”误报成“内容正确”。
+
+## 通用连接路径
+
+插件不再只认 `127.0.0.1:18080/v1`。`baseUrl` 会自动推导 speech 和 health 路径：
+
+| `baseUrl` 形式 | 推导出的 speech 端点 |
+|---|---|
+| `http://host:18080` | `http://host:18080/v1/audio/speech` |
+| `http://host:18080/v1` | `http://host:18080/v1/audio/speech` |
+| `https://host/prefix/v1` | `https://host/prefix/v1/audio/speech` |
+| `https://host/v1/audio/speech` | 原样使用 |
+
+`gatewayUrl` 是 `baseUrl` 的兼容别名。
+
+不符合 OpenAI 路径约定的服务使用完整覆盖：
+
+```yaml
+speechUrl: https://provider.example/custom/speech?api-version=2026-01-01
+healthUrl: https://provider.example/custom/health
+```
+
+非 Bearer 鉴权也可配置，例如：
+
+```yaml
+apiKey: "<local-secret>"
+authHeader: api-key
+authScheme: ""
+extraHeaders:
+  X-TTS-Route: blue
+```
+
+固定附加字段通过 `extraBody` 发送；核心字段 `input`、`voice`、`response_format` 和
+`text_lang` 始终以本次请求为准。状态输出会隐藏 API Key，并遮蔽 URL 中的 token/key/secret
+类查询参数。
+
+终端也可以临时覆盖连接：
+
+```powershell
+node .\plugin\bin\tts.mjs --status --base-url "https://host/prefix/v1"
+node .\plugin\bin\tts.mjs --status --endpoint "https://host/custom/speech"
+node .\plugin\bin\tts.mjs --status --health-url "https://host/custom/health"
+```
 
 ## OpenAI 兼容调用
 

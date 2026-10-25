@@ -127,8 +127,8 @@ function statusDefinition(runtime) {
   return {
     name: 'tts_status',
     description:
-      'Report the TTS plugin\'s effective configuration (endpoint, model, voice, default language, whether an API key '
-      + 'is set) and whether the endpoint is reachable. Use it when speech fails or sounds wrong, before guessing.',
+      'Report the TTS plugin\'s effective connection (speech URL, health URL, auth header, extra header names, model, '
+      + 'voice and language) and whether the endpoint is reachable. Use it when speech fails or sounds wrong.',
     parameters: { type: 'object', properties: {}, required: [] },
     output: {
       // This tool has exactly one result shape, so it can declare the full
@@ -138,6 +138,11 @@ function statusDefinition(runtime) {
         additionalProperties: false,
         properties: {
           baseUrl: { type: 'string' },
+          speechUrl: { type: 'string' },
+          healthUrl: { type: 'string' },
+          authHeader: { type: 'string' },
+          authScheme: { type: 'string' },
+          extraHeaderNames: { type: 'array', items: { type: 'string' } },
           model: { type: 'string' },
           voice: { type: 'string' },
           language: { type: 'string' },
@@ -148,27 +153,46 @@ function statusDefinition(runtime) {
             additionalProperties: false,
             properties: {
               ok: { type: 'boolean' },
+              reachable: { type: 'boolean' },
               status: { type: 'integer' },
               url: { type: 'string' },
+              tried: {
+                type: 'array',
+                items: {
+                  type: 'object',
+                  additionalProperties: false,
+                  properties: {
+                    url: { type: 'string' },
+                    status: { type: 'integer' },
+                  },
+                  required: ['url', 'status'],
+                },
+              },
             },
-            required: ['ok', 'status', 'url'],
+            required: ['ok', 'reachable', 'status', 'url', 'tried'],
           },
           cachedAudio: { type: 'integer' },
           route: { type: 'string' },
           languages: { type: 'array', items: { type: 'string' } },
         },
         required: [
-          'baseUrl', 'model', 'voice', 'language', 'promptLanguage',
+          'baseUrl', 'speechUrl', 'healthUrl', 'authHeader', 'authScheme',
+          'extraHeaderNames', 'model', 'voice', 'language', 'promptLanguage',
           'hasApiKey', 'upstream', 'cachedAudio', 'route', 'languages',
         ],
       },
       render(_args, value) {
         const data = value;
         const lines = [
-          `Endpoint: ${data.baseUrl}`,
-          `Model: ${data.model}   Voice: ${data.voice}   API key: ${data.hasApiKey ? 'set' : 'not set'}`,
+          `Speech endpoint: ${data.speechUrl}`,
+          `Health endpoint: ${data.healthUrl}`,
+          `Auth: ${data.authHeader}${data.authScheme ? ` / ${data.authScheme}` : ''}`
+          + `   API key: ${data.hasApiKey ? 'set' : 'not set'}`,
+          `Extra headers: ${data.extraHeaderNames.length > 0 ? data.extraHeaderNames.join(', ') : '(none)'}`,
+          `Model: ${data.model}   Voice: ${data.voice}`,
           `Default language: ${data.language}   Reference-audio language: ${data.promptLanguage || '(unset)'}`,
-          `Upstream: ${data.upstream.ok ? 'reachable' : 'UNREACHABLE'} (${data.upstream.url}`
+          `Upstream health: ${data.upstream.ok ? 'healthy' : data.upstream.reachable ? 'reachable' : 'UNREACHABLE'}`
+          + ` (${data.upstream.url}`
           + `${data.upstream.status ? `, HTTP ${data.upstream.status}` : ''})`,
           `Cached audio entries: ${data.cachedAudio}   Same-origin route: ${data.route}`,
           `Supported text languages: ${data.languages.join(', ')}`,
@@ -179,15 +203,28 @@ function statusDefinition(runtime) {
     timeoutMs: 30_000,
     async execute() {
       const config = runtime.getConfig();
-      const health = await runtime.client().health();
+      const client = runtime.client();
+      const health = await client.health();
+      const connection = client.describeConnection();
       return {
-        baseUrl: config.baseUrl,
+        baseUrl: connection.baseUrl,
+        speechUrl: connection.speechUrl,
+        healthUrl: connection.healthUrl,
+        authHeader: connection.authHeader,
+        authScheme: connection.authScheme,
+        extraHeaderNames: connection.extraHeaderNames,
         model: config.model,
         voice: config.voice,
         language: config.language,
         promptLanguage: config.promptLanguage,
-        hasApiKey: config.apiKey !== '',
-        upstream: { ok: health.ok, status: health.status ?? 0, url: health.url },
+        hasApiKey: connection.hasApiKey,
+        upstream: {
+          ok: health.ok,
+          reachable: health.reachable === true,
+          status: health.status ?? 0,
+          url: health.url,
+          tried: health.tried ?? [],
+        },
         cachedAudio: runtime.audio.size(),
         route: runtime.audioBasePath,
         languages: [...SYNTHESIS_LANGUAGES, 'auto'],

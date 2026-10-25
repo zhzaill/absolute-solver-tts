@@ -129,17 +129,59 @@ Binding to a non-loopback address without a key is rejected.
 | Key | Environment variable | Default |
 |---|---|---|
 | `baseUrl` | `DSH_TTS_BASE_URL` | `http://127.0.0.1:18080/v1` |
+| `speechUrl` | `DSH_TTS_SPEECH_URL` | empty; derived from `baseUrl` |
+| `healthUrl` | `DSH_TTS_HEALTH_URL` | empty; probes candidates derived from `baseUrl` |
 | `model` | `DSH_TTS_MODEL` | `tts-1` |
 | `voice` | `DSH_TTS_VOICE` | `local_voice` |
 | `language` | `DSH_TTS_LANGUAGE` | `zh` |
 | `promptLanguage` | `DSH_TTS_PROMPT_LANGUAGE` | `zh` |
 | `apiKey` | `DSH_TTS_API_KEY` | empty |
+| `authHeader` | `DSH_TTS_AUTH_HEADER` | `Authorization` |
+| `authScheme` | `DSH_TTS_AUTH_SCHEME` | `Bearer`; empty means raw key |
+| `extraHeaders` | `DSH_TTS_EXTRA_HEADERS` | `{}` or JSON object |
+| `extraBody` | `DSH_TTS_EXTRA_BODY` | `{}` or JSON object |
 | `timeoutMs` | `DSH_TTS_TIMEOUT_MS` | `120000` |
 | `cacheEntries` | `DSH_TTS_CACHE_ENTRIES` | `32` |
 
 The plugin's default endpoint is loopback because DSH commonly runs on a different
 origin from the gateway. Use the SSH tunnel rather than hard-coding a private LAN
 address.
+
+### Connection forms
+
+`baseUrl` accepts:
+
+- an origin: `http://host:18080`
+- an OpenAI API root: `http://host:18080/v1`
+- a path-prefixed root: `https://host/edge/tts/v1`
+- an exact speech endpoint: `https://host/edge/tts/v1/audio/speech`
+
+For providers that do not follow the OpenAI path convention, set `speechUrl`
+directly. Set `healthUrl` when the provider exposes a custom readiness endpoint;
+otherwise the plugin probes root and `/v1` health candidates.
+
+### Non-Bearer authentication
+
+Some providers use `api-key` rather than `Authorization: Bearer`.
+
+```yaml
+config:
+  speechUrl: https://provider.example/custom/speech?api-version=2026-01-01
+  healthUrl: https://provider.example/custom/health
+  apiKey: ""
+  authHeader: api-key
+  authScheme: ""
+```
+
+Keep the actual key in an environment variable. `extraHeaders` is for static
+routing or tenant headers. `extraBody` is for provider-specific JSON fields; core
+speech fields cannot be overwritten by it.
+
+### Multiple routes
+
+Use different environment-backed DSH profiles or launch DSH with different
+`DSH_TTS_*` values. Avoid putting private addresses or credentials in the bundle
+patch.
 
 ## Service ownership
 

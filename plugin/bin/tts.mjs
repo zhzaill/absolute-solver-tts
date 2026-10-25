@@ -54,7 +54,7 @@ const PROBES = [
 ];
 
 function parseArgs(argv) {
-  const options = { text: '', check: false, status: false, play: false, out: '', voice: '', language: '', asrUrl: '', seed: undefined, verify: '', expect: '', keep: false, positional: [], unknown: [] };
+  const options = { text: '', check: false, status: false, play: false, out: '', voice: '', language: '', asrUrl: '', baseUrl: '', endpoint: '', healthUrl: '', seed: undefined, verify: '', expect: '', keep: false, positional: [], unknown: [] };
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
     const next = () => argv[++i];
@@ -66,6 +66,9 @@ function parseArgs(argv) {
     else if (arg === '--voice') options.voice = next() ?? '';
     else if (arg === '--language') options.language = next() ?? '';
     else if (arg === '--asr') options.asrUrl = next() ?? '';
+    else if (arg === '--base-url') options.baseUrl = next() ?? '';
+    else if (arg === '--endpoint' || arg === '--speech-url') options.endpoint = next() ?? '';
+    else if (arg === '--health-url') options.healthUrl = next() ?? '';
     else if (arg === '--seed') options.seed = Number(next());
     else if (arg === '--verify') options.verify = next() ?? '';
     else if (arg === '--expect') options.expect = next() ?? '';
@@ -94,6 +97,9 @@ function usage() {
     '  tts "<文本>" --language zh|ja     显式声明语言（默认从文本推断）',
     '  tts "<文本>" --out <file.wav>     指定输出路径',
     '  tts "<文本>" --seed <int>         固定随机种子（引擎默认随机）',
+    '  tts --status --base-url <url>     覆盖 OpenAI API 根地址',
+    '  tts --status --endpoint <url>     覆盖完整 speech 端点',
+    '  tts --status --health-url <url>   覆盖完整 health 端点',
     '  tts --verify "D:\\path\\file.wav"   转写一个已有文件（字节数说明不了内容）',
     '  tts --verify "D:\\path\\file.wav" --expect "期望文本"',
     '                                    转写并与期望文本比对',
@@ -186,10 +192,20 @@ async function main() {
     return 0;
   }
 
-  const config = resolveConfig({});
+  const configOverrides = {};
+  if (options.baseUrl !== '') configOverrides.baseUrl = options.baseUrl;
+  if (options.endpoint !== '') configOverrides.speechUrl = options.endpoint;
+  if (options.healthUrl !== '') configOverrides.healthUrl = options.healthUrl;
+  const config = resolveConfig(configOverrides);
   const client = new TTSClient({
     baseUrl: config.baseUrl,
+    speechUrl: config.speechUrl,
+    healthUrl: config.healthUrl,
     apiKey: config.apiKey,
+    authHeader: config.authHeader,
+    authScheme: config.authScheme,
+    extraHeaders: config.extraHeaders,
+    extraBody: config.extraBody,
     model: config.model,
     voice: options.voice || config.voice,
     timeoutMs: config.timeoutMs,
@@ -199,14 +215,25 @@ async function main() {
 
   if (options.status) {
     const health = await client.health();
+    const connection = client.describeConnection();
     console.log('TTS relay');
-    console.log(hud('endpoint', config.baseUrl));
+    console.log(hud('base URL', connection.baseUrl));
+    console.log(hud('speech endpoint', connection.speechUrl));
+    console.log(hud('health endpoint', connection.healthUrl));
+    console.log(hud('auth', `${connection.authHeader}${connection.authScheme ? ` / ${connection.authScheme}` : ''}`));
+    console.log(hud('extra headers', connection.extraHeaderNames.length > 0 ? connection.extraHeaderNames.join(', ') : '(none)'));
     console.log(hud('model / voice', `${config.model} / ${options.voice || config.voice}`));
     console.log(hud('default language', config.language));
     console.log(hud('reference language', config.promptLanguage));
-    console.log(hud('api key', config.apiKey === '' ? 'not set' : 'set'));
-    console.log(hud('upstream', `${health.ok ? 'reachable' : 'UNREACHABLE'} (${health.url}${health.status ? `, HTTP ${health.status}` : ''})`));
-    return health.ok ? 0 : 1;
+    console.log(hud('api key', connection.hasApiKey ? 'set' : 'not set'));
+    console.log(hud('upstream', `${health.ok ? 'healthy' : health.reachable ? 'reachable' : 'UNREACHABLE'} (${health.url}${health.status ? `, HTTP ${health.status}` : ''})`));
+    const healthRouteMissing = health.reachable && [404, 405].includes(health.status);
+    if (!health.ok && healthRouteMissing) {
+      console.log('  note                   server answered, but the health route did not; set --health-url for a custom endpoint');
+    } else if (!health.ok && health.reachable) {
+      console.log('  note                   server answered, but the health check was not successful; check auth or server state');
+    }
+    return health.ok || healthRouteMissing ? 0 : 1;
   }
 
   if (options.verify !== '') {
@@ -252,10 +279,11 @@ async function main() {
 
   if (options.check) {
     const health = await client.health();
+    const connection = client.describeConnection();
     console.log('=== relay check ===');
-    console.log(hud('endpoint', config.baseUrl));
-    console.log(hud('upstream', health.ok ? `reachable (HTTP ${health.status})` : 'UNREACHABLE'));
-    if (!health.ok) return 1;
+    console.log(hud('endpoint', connection.speechUrl));
+    console.log(hud('upstream', health.ok ? `healthy (HTTP ${health.status})` : health.reachable ? `reachable (HTTP ${health.status})` : 'UNREACHABLE'));
+    if (!(health.ok || health.reachable)) return 1;
 
     const asrUrl = options.asrUrl || DEFAULTS.asrUrl;
     let asrOk = true;

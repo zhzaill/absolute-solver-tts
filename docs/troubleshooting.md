@@ -11,6 +11,24 @@ Get-NetTCPConnection -LocalPort 18080 -State Listen
 
 If the gateway is remote, confirm the SSH forward is still alive.
 
+If `--status` says `reachable` but not `healthy`, the host answered on a path that
+is not the expected `/healthz`. Set `healthUrl` or `DSH_TTS_HEALTH_URL` explicitly.
+This does not necessarily mean synthesis is broken.
+
+## A reverse proxy or custom provider is used
+
+`baseUrl` may include a path prefix. If the provider does not append
+`/audio/speech`, set the exact `speechUrl`. If it uses `api-key` instead of
+Bearer auth, set:
+
+```yaml
+authHeader: api-key
+authScheme: ""
+```
+
+The plugin never prints the key. Use `tts_status` to inspect the selected endpoint,
+auth header name and extra header names.
+
 ## `401 Invalid API key`
 
 Set the same `GATEWAY_API_KEY` on both sides:

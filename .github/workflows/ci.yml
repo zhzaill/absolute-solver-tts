@@ -32,6 +32,9 @@ jobs:
       - name: Plugin schema checks
         run: node plugin/tools/verify-schemas.mjs
 
+      - name: Provider-neutral connection checks
+        run: node plugin/tools/verify-connection.mjs
+
       - name: Plugin install-package checks
         run: node plugin/tools/verify-install.mjs plugin
 

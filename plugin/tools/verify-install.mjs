@@ -95,9 +95,15 @@ if (mod !== undefined) {
   check('resolveConfig applies the documented defaults', () => {
     const config = mod.resolveConfig({});
     assert.equal(config.baseUrl, 'http://127.0.0.1:18080/v1');
+    assert.equal(config.speechUrl, '');
+    assert.equal(config.healthUrl, '');
     assert.equal(config.voice, 'local_voice');
     assert.equal(config.language, 'zh');
     assert.equal(config.promptLanguage, 'zh');
+    assert.equal(config.authHeader, 'Authorization');
+    assert.equal(config.authScheme, 'Bearer');
+    assert.deepEqual(config.extraHeaders, {});
+    assert.deepEqual(config.extraBody, {});
     assert.equal(config.cacheEntries, 32);
   });
 

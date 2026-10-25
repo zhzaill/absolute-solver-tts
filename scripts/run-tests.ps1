@@ -29,6 +29,10 @@ try {
     if ($LASTEXITCODE -ne 0) {
         throw "Schema verification failed"
     }
+    node plugin\tools\verify-connection.mjs
+    if ($LASTEXITCODE -ne 0) {
+        throw "Connection verification failed"
+    }
     node plugin\tools\verify-install.mjs plugin
     if ($LASTEXITCODE -ne 0) {
         throw "Install verification failed"

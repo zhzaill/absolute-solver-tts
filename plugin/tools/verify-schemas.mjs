@@ -204,6 +204,15 @@ function check(label, fn) {
 // Capture the real definitions by registering into a capture-only context.
 const registered = [];
 const ctx = { tools: { register: (definition) => { registered.push(definition); return () => {}; } } };
+const connection = {
+  baseUrl: 'http://127.0.0.1:18080/v1',
+  speechUrl: 'http://127.0.0.1:18080/v1/audio/speech',
+  healthUrl: 'http://127.0.0.1:18080/healthz',
+  authHeader: 'Authorization',
+  authScheme: 'Bearer',
+  hasApiKey: false,
+  extraHeaderNames: [],
+};
 const runtime = {
   audio: { size: () => 0 },
   audioBasePath: '/dsh-tts/audio',
@@ -211,7 +220,16 @@ const runtime = {
     baseUrl: 'http://127.0.0.1:18080/v1', model: 'tts-1', voice: 'local_voice',
     language: 'zh', promptLanguage: 'zh', apiKey: '', timeoutMs: 120000, cacheEntries: 32,
   }),
-  client: () => ({ health: async () => ({ ok: true, status: 200, url: 'u' }) }),
+  client: () => ({
+    health: async () => ({
+      ok: true,
+      reachable: true,
+      status: 200,
+      url: 'u',
+      tried: [{ url: 'u', status: 200 }],
+    }),
+    describeConnection: () => connection,
+  }),
   synthesize: async () => ({ id: 'x', cached: false, bytes: 1, durationSeconds: 1, sampleRate: 24000, voice: 'v', language: 'zh', languageReason: 'inferred' }),
 };
 registerTTSTools(ctx, runtime);

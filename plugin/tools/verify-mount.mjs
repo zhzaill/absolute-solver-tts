@@ -287,6 +287,12 @@ const server = http.createServer((request, response) => {
 });
 
 const TEST_BASE_URL = process.env.DSH_TTS_TEST_BASE_URL ?? 'http://127.0.0.1:18080/v1';
+const TEST_CONFIG = resolveConfig({
+  baseUrl: TEST_BASE_URL,
+  voice: 'local_voice',
+  language: 'zh',
+  promptLanguage: 'zh',
+});
 
 await apply(live.ctx, {
   baseUrl: TEST_BASE_URL,
@@ -308,14 +314,23 @@ log.push(`  note  test server listening on ${origin}`);
  * something it does not own — and a suite that goes red for a normal state
  * teaches people to ignore red.
  */
-async function upstreamReachable(baseUrl) {
-  try {
-    const root = baseUrl.replace(/\/v1\/?$/, '');
-    const response = await fetch(`${root}/healthz`, { signal: AbortSignal.timeout(5000) });
-    return response.ok;
-  } catch {
-    return false;
-  }
+async function upstreamHealth() {
+  const client = new TTSClient({
+    baseUrl: TEST_CONFIG.baseUrl,
+    speechUrl: TEST_CONFIG.speechUrl,
+    healthUrl: TEST_CONFIG.healthUrl,
+    apiKey: TEST_CONFIG.apiKey,
+    authHeader: TEST_CONFIG.authHeader,
+    authScheme: TEST_CONFIG.authScheme,
+    extraHeaders: TEST_CONFIG.extraHeaders,
+    extraBody: TEST_CONFIG.extraBody,
+    model: TEST_CONFIG.model,
+    voice: TEST_CONFIG.voice,
+    timeoutMs: TEST_CONFIG.timeoutMs,
+    language: TEST_CONFIG.language,
+    promptLanguage: TEST_CONFIG.promptLanguage,
+  });
+  return client.health();
 }
 
 function skip(label, reason) {
@@ -324,7 +339,8 @@ function skip(label, reason) {
   log.push(line);
 }
 
-const LIVE = await upstreamReachable(TEST_BASE_URL);
+const HEALTH = await upstreamHealth();
+const LIVE = HEALTH.ok || HEALTH.reachable;
 if (!LIVE) {
   const note = `  note  upstream unreachable at ${TEST_BASE_URL}; `
     + 'execution checks are SKIPPED, not failed';
@@ -418,14 +434,17 @@ await checkAsync('the status route reports effective config and upstream health'
   assert.equal(response.status, 200);
   assert.equal(response.headers.get('content-type'), 'application/json; charset=utf-8');
   const body = JSON.parse(await response.text());
-  assert.equal(body.baseUrl, TEST_BASE_URL);
+  assert.equal(body.baseUrl, TEST_CONFIG.baseUrl);
+  assert.equal(body.speechUrl.endsWith('/audio/speech'), true);
+  assert.ok(body.healthUrl.endsWith('/healthz'));
   assert.equal(body.voice, 'local_voice');
   assert.equal(body.language, 'zh');
   assert.equal(body.hasApiKey, false);
   // Assert that the route reports reality, not that reality is "up". A hardcoded
   // `true` here would make this check fail whenever the GPU is lent out, and
   // pass whenever it is not — measuring the environment rather than the route.
-  assert.equal(body.ok, LIVE, `status route disagrees with the probe: ${JSON.stringify(body.upstream)}`);
+  assert.equal(body.ok, HEALTH.ok, `status route disagrees with the probe: ${JSON.stringify(body.upstream)}`);
+  assert.equal(body.reachable, HEALTH.reachable, 'status route reachability disagrees with the probe');
   // The status route reports *whether* a key is set, never the key itself.
   // Assert the absence of the key rather than substring-matching the payload:
   // `hasApiKey` contains the substring and would satisfy a sloppy check.
@@ -442,8 +461,14 @@ await checkAsync('a Japanese sentence is declared as ja, not silently read as Ch
   // the environment instead of the contract.
   const japaneseText = '今日のデプロイは無事に完了したわ。';
   const probe = new TTSClient({
-    baseUrl: TEST_BASE_URL,
-    model: resolveConfig({}).model,
+    baseUrl: TEST_CONFIG.baseUrl,
+    speechUrl: TEST_CONFIG.speechUrl,
+    healthUrl: TEST_CONFIG.healthUrl,
+    authHeader: TEST_CONFIG.authHeader,
+    authScheme: TEST_CONFIG.authScheme,
+    extraHeaders: TEST_CONFIG.extraHeaders,
+    extraBody: TEST_CONFIG.extraBody,
+    model: TEST_CONFIG.model,
     voice: 'local_voice',
     language: 'zh',
     promptLanguage: 'zh',

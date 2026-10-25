@@ -59,15 +59,23 @@ export function mountTTSRoutes(ctx, runtime) {
         return;
       }
       const config = runtime.getConfig();
-      const health = await runtime.client().health();
+      const client = runtime.client();
+      const health = await client.health();
+      const connection = client.describeConnection();
       const body = JSON.stringify({
         ok: health.ok,
-        baseUrl: config.baseUrl,
+        reachable: health.reachable === true,
+        baseUrl: connection.baseUrl,
+        speechUrl: connection.speechUrl,
+        healthUrl: connection.healthUrl,
+        authHeader: connection.authHeader,
+        authScheme: connection.authScheme,
+        extraHeaderNames: connection.extraHeaderNames,
         model: config.model,
         voice: config.voice,
         language: config.language,
         promptLanguage: config.promptLanguage,
-        hasApiKey: config.apiKey !== '',
+        hasApiKey: connection.hasApiKey,
         upstream: health,
         cachedAudio: runtime.audio.size(),
       }, null, 2);

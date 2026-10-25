@@ -20,6 +20,7 @@ import { AudioStore, audioKey } from './store.js';
 import { registerTTSTools } from './tools.js';
 import { mountTTSRoutes } from './routes.js';
 import { registerVoiceContract } from './contract.js';
+import { parseObject } from './connection.js';
 
 export const name = 'dsh-tts';
 
@@ -29,6 +30,8 @@ export const inject = ['tools'];
 const DEFAULTS = {
   /** The GPT-SoVITS OpenAI-compatible gateway on the model server. */
   baseUrl: 'http://127.0.0.1:18080/v1',
+  speechUrl: '',
+  healthUrl: '',
   model: 'tts-1',
   /** Voice id registered on the gateway. */
   voice: 'local_voice',
@@ -37,6 +40,10 @@ const DEFAULTS = {
   /** Default synthesis language: Chinese, as requested. */
   language: 'zh',
   apiKey: '',
+  authHeader: 'Authorization',
+  authScheme: 'Bearer',
+  extraHeaders: {},
+  extraBody: {},
   timeoutMs: 120_000,
   cacheEntries: 32,
 };
@@ -73,8 +80,30 @@ function firstNonBlank(...values) {
 /** Merge patch config, environment and defaults into one frozen record. */
 export function resolveConfig(entryConfig = {}) {
   const env = typeof process !== 'undefined' ? process.env : {};
+  const connection = entryConfig.connection !== null && typeof entryConfig.connection === 'object'
+    ? entryConfig.connection
+    : {};
   return Object.freeze({
-    baseUrl: String(firstNonBlank(entryConfig.baseUrl, env.DSH_TTS_BASE_URL, DEFAULTS.baseUrl)),
+    baseUrl: String(firstNonBlank(
+      entryConfig.baseUrl,
+      entryConfig.gatewayUrl,
+      connection.baseUrl,
+      connection.gatewayUrl,
+      env.DSH_TTS_BASE_URL,
+      DEFAULTS.baseUrl,
+    )),
+    speechUrl: String(first(
+      entryConfig.speechUrl,
+      connection.speechUrl,
+      env.DSH_TTS_SPEECH_URL,
+      DEFAULTS.speechUrl,
+    ) ?? ''),
+    healthUrl: String(first(
+      entryConfig.healthUrl,
+      connection.healthUrl,
+      env.DSH_TTS_HEALTH_URL,
+      DEFAULTS.healthUrl,
+    ) ?? ''),
     model: String(firstNonBlank(entryConfig.model, env.DSH_TTS_MODEL, DEFAULTS.model)),
     voice: String(firstNonBlank(entryConfig.voice, env.DSH_TTS_VOICE, DEFAULTS.voice)),
     promptLanguage: String(firstNonBlank(
@@ -83,6 +112,31 @@ export function resolveConfig(entryConfig = {}) {
     language: String(firstNonBlank(entryConfig.language, env.DSH_TTS_LANGUAGE, DEFAULTS.language)),
     // An empty key is a valid configuration, so blanks are kept rather than skipped.
     apiKey: String(first(entryConfig.apiKey, env.DSH_TTS_API_KEY, DEFAULTS.apiKey) ?? ''),
+    authHeader: String(first(
+      entryConfig.authHeader,
+      connection.authHeader,
+      env.DSH_TTS_AUTH_HEADER,
+      DEFAULTS.authHeader,
+    ) ?? ''),
+    // An empty scheme is valid for Azure-style `api-key` headers.
+    authScheme: String(first(
+      entryConfig.authScheme,
+      connection.authScheme,
+      env.DSH_TTS_AUTH_SCHEME,
+      DEFAULTS.authScheme,
+    ) ?? ''),
+    extraHeaders: Object.freeze(parseObject(first(
+      entryConfig.extraHeaders,
+      connection.extraHeaders,
+      env.DSH_TTS_EXTRA_HEADERS,
+      DEFAULTS.extraHeaders,
+    ), 'extraHeaders')),
+    extraBody: Object.freeze(parseObject(first(
+      entryConfig.extraBody,
+      connection.extraBody,
+      env.DSH_TTS_EXTRA_BODY,
+      DEFAULTS.extraBody,
+    ), 'extraBody')),
     timeoutMs: Number(firstNonBlank(entryConfig.timeoutMs, env.DSH_TTS_TIMEOUT_MS, DEFAULTS.timeoutMs)),
     cacheEntries: Number(firstNonBlank(
       entryConfig.cacheEntries, env.DSH_TTS_CACHE_ENTRIES, DEFAULTS.cacheEntries,
@@ -97,7 +151,13 @@ export function resolveConfig(entryConfig = {}) {
 export function createRuntime(config = resolveConfig()) {
   const client = new TTSClient({
     baseUrl: config.baseUrl,
+    speechUrl: config.speechUrl,
+    healthUrl: config.healthUrl,
     apiKey: config.apiKey,
+    authHeader: config.authHeader,
+    authScheme: config.authScheme,
+    extraHeaders: config.extraHeaders,
+    extraBody: config.extraBody,
     model: config.model,
     voice: config.voice,
     timeoutMs: config.timeoutMs,
@@ -208,6 +268,7 @@ export async function apply(ctx, entryConfig = {}) {
   });
 
   ctx.logger?.info?.(
-    `[dsh-tts] ready: ${config.baseUrl} voice=${config.voice} default=${config.language}`,
+    `[dsh-tts] ready: ${runtime.client().describeConnection().speechUrl}`
+    + ` voice=${config.voice} default=${config.language}`,
   );
 }

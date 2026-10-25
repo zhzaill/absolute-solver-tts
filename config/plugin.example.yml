@@ -2,11 +2,18 @@
 - id: tool-tts
   name: dsh-tts
   config:
+    # Origin, API root, path-prefixed API root, or a complete speech URL are all accepted.
     baseUrl: http://127.0.0.1:18080/v1
+    # speechUrl: https://provider.example/custom/speech?api-version=2026-01-01
+    # healthUrl: https://provider.example/custom/health
     model: tts-1
     voice: local_voice
     language: zh
     promptLanguage: zh
     apiKey: ""
+    authHeader: Authorization
+    authScheme: Bearer
+    extraHeaders: {}
+    extraBody: {}
     timeoutMs: 120000
     cacheEntries: 32

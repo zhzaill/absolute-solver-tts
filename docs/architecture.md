@@ -77,6 +77,15 @@ It contributes:
 The browser cannot treat a direct fetch to the gateway as same-origin. The plugin
 stores the WAV under a content hash and returns a relative same-origin URL instead.
 
+Connection resolution is provider-neutral:
+
+1. `speechUrl` is used verbatim when supplied.
+2. Otherwise `baseUrl` may be an origin, `/v1` root, path-prefixed root, or the
+   final speech URL.
+3. Auth may use `Authorization: Bearer`, a custom header, or a raw key.
+4. Static routing headers and provider-specific body fields can be supplied.
+5. Status output reports only redacted endpoints and header names.
+
 ### Terminal client
 
 `plugin/bin/tts.mjs` drives the same client code without DSH:
