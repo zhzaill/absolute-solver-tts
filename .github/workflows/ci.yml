@@ -1,0 +1,41 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install Python dependencies
+        run: python -m pip install -r gateway/requirements.txt
+
+      - name: Python tests
+        run: python -m unittest discover -s tests -v
+
+      - name: JavaScript syntax
+        shell: bash
+        run: |
+          find plugin -name '*.mjs' -type f -print0 | xargs -0 -n1 node --check
+
+      - name: Plugin schema checks
+        run: node plugin/tools/verify-schemas.mjs
+
+      - name: Plugin install-package checks
+        run: node plugin/tools/verify-install.mjs plugin
+
+      - name: Offline plugin self-test
+        env:
+          DSH_TTS_TEST_BASE_URL: http://127.0.0.1:9/v1
+        run: node plugin/tools/selftest.mjs

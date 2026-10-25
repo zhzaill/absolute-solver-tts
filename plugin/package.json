@@ -1,0 +1,49 @@
+{
+  "name": "dsh-tts",
+  "version": "0.1.0",
+  "description": "DeepSeek Harness bundle: gives the agent a voice through an OpenAI-compatible TTS endpoint (GPT-SoVITS gateway), with same-origin audio playback, explicit text-language declaration, and Chinese by default. Ported from Amadeus's openai_compatible TTS backend. / 让 DSH 的 Agent 有嗓子：经 OpenAI 兼容 TTS 端点（GPT-SoVITS 网关）合成语音，同源播放，显式声明文本语言，默认中文。",
+  "type": "module",
+  "private": true,
+  "main": "lib/index.js",
+  "icon": "./icon.svg",
+  "bin": {
+    "tts": "./bin/tts.mjs"
+  },
+  "exports": {
+    ".": "./lib/index.js",
+    "./cli": "./bin/tts.mjs",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json",
+    "./locale/*.json": "./locale/*.json"
+  },
+  "files": [
+    "lib",
+    "bin",
+    "locale",
+    "icon.svg",
+    "cordis.patch.yml",
+    "LICENSE",
+    "README.md"
+  ],
+  "keywords": [
+    "deepseek",
+    "harness",
+    "dsh",
+    "dsh-plugin",
+    "tts",
+    "speech",
+    "gpt-sovits",
+    "voice"
+  ],
+  "license": "AGPL-3.0-only",
+  "engines": {
+    "node": ">=22.19"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": [
+        "./cordis.patch.yml"
+      ]
+    }
+  }
+}

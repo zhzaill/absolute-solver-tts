@@ -1,0 +1,53 @@
+# Local configuration and credentials
+.env
+.env.*
+!.env.example
+*.secret
+*.token
+*.key
+
+# Voice assets and generated model state
+gateway_state.json
+config/*.local.json
+refs/
+references/
+voices/
+*-weights/
+SoVITS_weights*/
+GPT_weights*/
+*.ckpt
+*.pth
+*.pt
+*.onnx
+*.wav
+*.mp3
+*.flac
+*.m4a
+*.ogg
+tts-out/
+.run/
+
+# Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Node
+node_modules/
+*.tgz
+npm-debug.log*
+pnpm-debug.log*
+
+# Runtime logs and local test output
+*.log
+logs/
+_out_test/
+*.tmp
+
+# OS and editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

@@ -1,0 +1,14 @@
+{
+  "default": "local_voice",
+  "voices": {
+    "local_voice": {
+      "gpt": "GPT_weights_v2/local_voice-e15.ckpt",
+      "sovits": "SoVITS_weights_v2/local_voice_e8_s208.pth",
+      "ref_audio": "outputs/voice/reference.wav",
+      "ref_text": "Replace this with the exact transcript of the reference audio.",
+      "ref_lang": "zh",
+      "text_lang": "zh",
+      "speed": 1.0
+    }
+  }
+}

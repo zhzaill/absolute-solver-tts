@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Text to speech",
+    "description": "Gives the agent a voice: synthesizes speech through an OpenAI-compatible endpoint, serves it from this origin for playback, and declares the text language explicitly so it is never read by the wrong phonemizer. Adds the \"对话·有声\" conversation preset."
+  }
+}

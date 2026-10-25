@@ -1,0 +1,12 @@
+# Example DSH agent entry. Merge this into the preset owned by your deployment.
+- id: tool-tts
+  name: dsh-tts
+  config:
+    baseUrl: http://127.0.0.1:18080/v1
+    model: tts-1
+    voice: local_voice
+    language: zh
+    promptLanguage: zh
+    apiKey: ""
+    timeoutMs: 120000
+    cacheEntries: 32
