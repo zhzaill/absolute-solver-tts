@@ -1,87 +1,418 @@
-"""
-GPT-SoVITS OpenAI 兼容 API 网关
-================================
+"""TTS Service —— 局域网共享的 OpenAI 兼容语音合成服务
+=====================================================
 
-把本地 GPT-SoVITS 模型暴露成标准的 OpenAI 语音接口，任何支持 OpenAI 的客户端
-（OpenAI SDK、LangChain、SillyTavern、各种 TTS 前端）都能直接调用。
+一个进程同时提供三件事：
 
-核心设计：**参考音频只需设一次**，之后客户端请求只要给 text。
-（官方 api_v2.py 要求每次请求都传 ref_audio_path，这层网关补上这个缺口。）
+  1. **OpenAI 兼容接口**（给 Hub、DSH 插件、AnythingLLM、SillyTavern 等客户端）
+       POST /v1/audio/speech     合成，返回音频
+       GET  /v1/audio/voices     可用音色
+       GET  /v1/models           OpenAI 兼容模型列表
+       GET  /healthz             健康检查（公开，供探活使用）
+  2. **配置界面**（浏览器打开 http://<服务器>:18080/admin）
+       音色管理、客户端密钥、服务设置、上游进程、最近请求、调用示例
+  3. **浏览器侧播放**：配置界面里可直接试听，不需要额外工具
 
-对外接口
---------
-  POST /v1/audio/speech          OpenAI 兼容：{"input": "...", "voice": "xxx"} → 音频
-  GET  /v1/audio/voices          列出可用音色（= 每个模型一套参考音频）
-  GET  /v1/models                OpenAI 兼容模型列表
-  POST /v1/audio/voices          注册/更新音色（绑定模型 + 参考音频）
-  GET  /healthz                  健康检查
+设计边界（2026-10-27 定稿）
+--------------------------
+  * 客户端鉴权：`Authorization: Bearer sk-...` 或 `x-api-key`，多把密钥、可停用、可轮换。
+  * 管理鉴权：独立管理员口令，HttpOnly 会话 Cookie；不与客户端密钥共用。
+  * 监听地址来自 config.json（默认 0.0.0.0:18080），因此必须存在管理员口令与至少一把客户端密钥。
+  * **不做伪流式**：上游分段响应在本服务被完整收齐后再返回。`/v1/audio/speech` 返回的是
+    完整音频，与 OpenAI 的语义一致。Provider 侧流式 PCM 属于独立任务，见
+    `D:\\11\\Logs\\2026-10-27-tts-streaming-pcm-可行性判定.md`。
+  * 参考音频只需注册一次（`/v1/audio/voices`），之后客户端只传 text；语言由文本推断，
+    可用 `text_lang` 显式覆盖。
 
-事实依据（均已双次验证）
-  - 官方接口 5 个：/tts /control /set_refer_audio /set_gpt_weights /set_sovits_weights
-  - /tts 必填：text, text_lang, ref_audio_path, prompt_lang（api_v2.py:305-342）
-  - 权重命名：SoVITS=.pth (config.py:95)，GPT=.ckpt (config.py:107)
-  - 日志实测：/set_*_weights 返回 {"message":"success"}
+运行
+----
+    python gateway.py                 # 读取同目录 config.json
+    TTS_CONFIG=... python gateway.py  # 指定配置文件
+
+配套启动器（含崩溃/改端口后的自动重启）见 `run-tts-service.cmd`。
 """
 
 from __future__ import annotations
 
-import io
-import re
+import collections
+import hashlib
+import hmac
 import json
 import os
+import re
 import secrets
 import shutil
 import subprocess
+import threading
 import time
 from pathlib import Path
-from typing import Any, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 import uvicorn
 from fastapi import Body, FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import Response
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Response
+
+VERSION = "2.0.0"
+SERVICE_NAME = "tts-service"
+ADMIN_COOKIE = "tts_admin"
+
+GATEWAY_DIR = Path(__file__).resolve().parent
+UI_DIR = GATEWAY_DIR / "ui"
+CONFIG_PATH = Path(os.environ.get("TTS_CONFIG", str(GATEWAY_DIR / "config.json"))).expanduser()
+LEGACY_STATE_PATH = GATEWAY_DIR / "gateway_state.json"
+
+# 退出码 75：请求启动器重启（配置改了监听地址/并发时需要重新 bind）。
+EXIT_RESTART = 75
+
 
 # ----------------------------------------------------------------------------
 # 配置
 # ----------------------------------------------------------------------------
 
-GATEWAY_DIR = Path(__file__).resolve().parent
-WORKSPACE = GATEWAY_DIR.parent
+DEFAULT_CONFIG: Dict[str, Any] = {
+    "version": 2,
+    "server": {
+        "host": "0.0.0.0",
+        "port": 18080,
+        # 写进调用示例里给客户端用的地址；留空则由监听地址推断
+        "public_base_url": "",
+    },
+    "upstream": {
+        "base": "http://127.0.0.1:9880",
+        "api_host": "127.0.0.1",
+        "api_port": 9880,
+        "config_path": "GPT_SoVITS/configs/tts_infer.yaml",
+        "log_path": "",
+        "timeout_seconds": 600,
+        "start_timeout_seconds": 180,
+    },
+    "auth": {
+        "admin_password_hash": "",
+        "cookie_secret": "",
+        "session_hours": 12,
+        "allow_remote_setup": False,
+    },
+    "keys": [],
+    "defaults": {"voice": None, "response_format": "wav", "speed": 1.0},
+    "limits": {"max_input_chars": 2000, "max_concurrent": 2},
+    # voice_id -> {gpt, sovits, ref_audio, ref_text, ref_lang, text_lang, speed, auto_text_lang}
+    "voices": {},
+}
 
-# 网关自身端口（18080：空闲、不在系统保留区间、与原 7800/9880/9874 不冲突）
-PORT = int(os.environ.get("GATEWAY_PORT", "18080"))
-HOST = os.environ.get("GATEWAY_HOST", "127.0.0.1")
+RESTART_FIELDS = {
+    "server.host",
+    "server.port",
+    "limits.max_concurrent",
+}
 
-# 上游官方 api_v2.py
-UPSTREAM_PORT = int(os.environ.get("GPTSOVITS_API_PORT", "9880"))
-UPSTREAM = f"http://127.0.0.1:{UPSTREAM_PORT}"
+CONFIG_LOCK = threading.RLock()
+_CONF: Dict[str, Any] = {}
+_CONF_MTIME: float = -1.0
 
-# 可选 API Key；为空则不校验（局域网内网使用）
-API_KEY = os.environ.get("GATEWAY_API_KEY", "").strip()
 
-STATE_FILE = Path(
-    os.environ.get("GATEWAY_STATE_FILE", str(GATEWAY_DIR / "gateway_state.json"))
-).expanduser()
+def _deep_merge(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]:
+    out = dict(base)
+    for key, value in override.items():
+        if isinstance(value, dict) and isinstance(out.get(key), dict):
+            out[key] = _deep_merge(out[key], value)
+        else:
+            out[key] = value
+    return out
 
-CORS_ORIGINS = [
-    value.strip()
-    for value in os.environ.get("GATEWAY_CORS_ORIGINS", "*").split(",")
-    if value.strip()
-]
+
+def _config_template() -> Dict[str, Any]:
+    return json.loads(json.dumps(DEFAULT_CONFIG))
+
+
+def _read_config_file() -> Dict[str, Any]:
+    if not CONFIG_PATH.is_file():
+        return {}
+    try:
+        raw = json.loads(CONFIG_PATH.read_text(encoding="utf-8") or "{}")
+    except Exception:
+        return {}
+    return raw if isinstance(raw, dict) else {}
+
+
+def _atomic_write(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + f".tmp{os.getpid()}")
+    tmp.write_text(text, encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def save_config(cfg: Dict[str, Any]) -> None:
+    global _CONF, _CONF_MTIME
+    with CONFIG_LOCK:
+        _atomic_write(CONFIG_PATH, json.dumps(cfg, ensure_ascii=False, indent=2) + "\n")
+        _CONF = cfg
+        try:
+            _CONF_MTIME = CONFIG_PATH.stat().st_mtime
+        except OSError:
+            _CONF_MTIME = -1.0
+
+
+def load_config(force: bool = False) -> Dict[str, Any]:
+    """读取配置；文件被外部改动时自动重新加载。"""
+    global _CONF, _CONF_MTIME
+    with CONFIG_LOCK:
+        try:
+            mtime = CONFIG_PATH.stat().st_mtime
+        except OSError:
+            mtime = -1.0
+        if _CONF and not force and mtime == _CONF_MTIME:
+            return _CONF
+        cfg = _deep_merge(_config_template(), _read_config_file())
+        if not cfg["auth"].get("cookie_secret"):
+            cfg["auth"]["cookie_secret"] = secrets.token_hex(32)
+        _CONF = cfg
+        _CONF_MTIME = mtime
+        return cfg
+
+
+def _migrate_legacy_state(cfg: Dict[str, Any]) -> bool:
+    """把 v1 的 gateway_state.json（音色表）并入 v2 配置。"""
+    if cfg.get("voices"):
+        return False
+    if not LEGACY_STATE_PATH.is_file():
+        return False
+    try:
+        old = json.loads(LEGACY_STATE_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return False
+    voices = old.get("voices") or {}
+    if not isinstance(voices, dict) or not voices:
+        return False
+    cfg["voices"] = voices
+    if not cfg["defaults"].get("voice"):
+        cfg["defaults"]["voice"] = old.get("default_voice") or next(iter(voices), None)
+    return True
+
+
+def bootstrap_config() -> Dict[str, Any]:
+    """首次启动：迁移旧音色、写死 Cookie 密钥、从环境变量取管理员口令。"""
+    cfg = load_config(force=True)
+    changed = not CONFIG_PATH.is_file()
+    if _migrate_legacy_state(cfg):
+        changed = True
+    if not cfg["auth"].get("cookie_secret"):
+        cfg["auth"]["cookie_secret"] = secrets.token_hex(32)
+        changed = True
+    env_password = os.environ.get("TTS_ADMIN_PASSWORD", "").strip()
+    if env_password and not cfg["auth"].get("admin_password_hash"):
+        cfg["auth"]["admin_password_hash"] = hash_password(env_password)
+        changed = True
+    if changed:
+        save_config(cfg)
+    return cfg
+
+
+# ----------------------------------------------------------------------------
+# 口令 / 会话 / 客户端密钥
+# ----------------------------------------------------------------------------
+
+PBKDF2_ROUNDS = 200_000
+
+
+def hash_password(password: str) -> str:
+    salt = secrets.token_hex(16)
+    digest = hashlib.pbkdf2_hmac(
+        "sha256", password.encode("utf-8"), salt.encode("utf-8"), PBKDF2_ROUNDS
+    ).hex()
+    return f"pbkdf2_sha256${PBKDF2_ROUNDS}${salt}${digest}"
+
+
+def verify_password(password: str, encoded: str) -> bool:
+    if not encoded or not password:
+        return False
+    try:
+        algo, rounds, salt, digest = encoded.split("$", 3)
+        if algo != "pbkdf2_sha256":
+            return False
+        candidate = hashlib.pbkdf2_hmac(
+            "sha256", password.encode("utf-8"), salt.encode("utf-8"), int(rounds)
+        ).hex()
+        return hmac.compare_digest(candidate, digest)
+    except Exception:
+        return False
+
+
+def _sign_exp(exp: int, secret: str) -> str:
+    return hmac.new(
+        secret.encode("utf-8"), f"v1:{exp}".encode("utf-8"), hashlib.sha256
+    ).hexdigest()[:32]
+
+
+def issue_session(cfg: Dict[str, Any]) -> Tuple[str, int]:
+    ttl = int(float(cfg["auth"].get("session_hours") or 12) * 3600)
+    ttl = max(300, min(ttl, 30 * 24 * 3600))
+    exp = int(time.time()) + ttl
+    return f"{exp}.{_sign_exp(exp, cfg['auth']['cookie_secret'])}", ttl
+
+
+def session_valid(token: str, cfg: Dict[str, Any]) -> bool:
+    if not token or "." not in token:
+        return False
+    exp_text, signature = token.split(".", 1)
+    try:
+        exp = int(exp_text)
+    except ValueError:
+        return False
+    if exp < time.time():
+        return False
+    return hmac.compare_digest(signature, _sign_exp(exp, cfg["auth"]["cookie_secret"]))
+
+
+def _owner_key(token: str, cfg: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """在已启用密钥中做常量时间比对，返回命中的密钥记录。"""
+    if not token:
+        return None
+    hit: Optional[Dict[str, Any]] = None
+    for record in cfg.get("keys") or []:
+        if not isinstance(record, dict):
+            continue
+        if not record.get("enabled", True):
+            continue
+        expected = str(record.get("key") or "")
+        if expected and secrets.compare_digest(expected, token):
+            hit = record
+    return hit
+
+
+_KEY_TOUCH: Dict[str, Tuple[int, float]] = {}
+_KEY_TOUCH_LOCK = threading.Lock()
+
+
+def _touch_key(record: Dict[str, Any]) -> None:
+    """计数留在内存，靠周期性落盘避免每个请求都写磁盘。"""
+    kid = str(record.get("id") or "")
+    with _KEY_TOUCH_LOCK:
+        count, last = _KEY_TOUCH.get(kid, (int(record.get("uses") or 0), 0.0))
+        _KEY_TOUCH[kid] = (count + 1, time.time())
+
+
+def _flush_key_usage() -> None:
+    with _KEY_TOUCH_LOCK:
+        if not _KEY_TOUCH:
+            return
+        pending = dict(_KEY_TOUCH)
+        _KEY_TOUCH.clear()
+    cfg = load_config()
+    changed = False
+    for record in cfg.get("keys") or []:
+        kid = str(record.get("id") or "")
+        if kid in pending:
+            count, last = pending[kid]
+            record["uses"] = count
+            record["last_used_at"] = int(last)
+            changed = True
+    if changed:
+        save_config(cfg)
+
+
+def _flush_loop() -> None:
+    while True:
+        time.sleep(30)
+        try:
+            _flush_key_usage()
+        except Exception:
+            pass
+
+
+def require_client(authorization: Optional[str], x_api_key: Optional[str]) -> Dict[str, Any]:
+    cfg = load_config()
+    token = ""
+    if authorization and authorization.lower().startswith("bearer "):
+        token = authorization[7:].strip()
+    elif x_api_key:
+        token = x_api_key.strip()
+    if not (cfg.get("keys") or []):
+        raise HTTPException(503, "服务尚未创建客户端密钥，请先在配置界面创建")
+    record = _owner_key(token, cfg)
+    if record is None:
+        raise HTTPException(401, "Invalid API key")
+    _touch_key(record)
+    return record
+
+
+def _admin_token(request: Request) -> str:
+    return request.headers.get("x-admin-token") or request.cookies.get(ADMIN_COOKIE) or ""
+
+
+def require_admin(request: Request) -> None:
+    cfg = load_config()
+    token = _admin_token(request)
+    if not session_valid(token, cfg):
+        raise HTTPException(401, "未登录或会话已过期")
+    # 用 Cookie 鉴权的写操作要求自定义头，避免跨站表单直接改写配置。
+    if request.method not in ("GET", "HEAD", "OPTIONS"):
+        if not request.headers.get("x-admin-token") and request.headers.get("x-tts-admin") != "1":
+            raise HTTPException(403, "缺少 X-TTS-Admin 请求头")
+
+
+# ----------------------------------------------------------------------------
+# 运行期统计
+# ----------------------------------------------------------------------------
+
+STATS_LOCK = threading.Lock()
+STATS: Dict[str, Any] = {
+    "started_at": time.time(),
+    "speech_requests": 0,
+    "speech_ok": 0,
+    "speech_failed": 0,
+    "chars": 0,
+    "bytes": 0,
+}
+RECENT: "collections.deque[Dict[str, Any]]" = collections.deque(maxlen=100)
+SLOT_LOCK = threading.Lock()
+_SLOTS = threading.BoundedSemaphore(2)
+
+
+def _record(entry: Dict[str, Any]) -> None:
+    with STATS_LOCK:
+        RECENT.appendleft(entry)
+        STATS["speech_requests"] += 1
+        if entry.get("status") and 200 <= int(entry["status"]) < 300:
+            STATS["speech_ok"] += 1
+            STATS["chars"] += int(entry.get("chars") or 0)
+            STATS["bytes"] += int(entry.get("bytes") or 0)
+        else:
+            STATS["speech_failed"] += 1
+
+
+# ----------------------------------------------------------------------------
+# 上游（GPT-SoVITS api_v2.py）
+# ----------------------------------------------------------------------------
+
+_KANA_RE = re.compile(r"[\u3040-\u309f\u30a0-\u30ff]")
+_HAN_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]")
+_LATIN_RE = re.compile(r"[A-Za-z]")
+
+
+def _detect_text_lang(text: str) -> str:
+    """尽力判断文本语言：ja / zh / en / 空。"""
+    value = str(text or "")
+    if _KANA_RE.search(value):
+        return "ja"
+    if _HAN_RE.search(value):
+        return "zh"
+    if _LATIN_RE.search(value):
+        return "en"
+    return ""
 
 
 def find_install() -> Optional[Path]:
     env = os.environ.get("GPTSOVITS_HOME")
     if env and (Path(env) / "api_v2.py").is_file():
         return Path(env)
-    for base in (GATEWAY_DIR, WORKSPACE):
+    for base in (GATEWAY_DIR, GATEWAY_DIR.parent):
         if (base / "api_v2.py").is_file() and (base / "webui.py").is_file():
             return base
         if base.is_dir():
-            for c in base.iterdir():
-                if c.is_dir() and (c / "api_v2.py").is_file() and (c / "webui.py").is_file():
-                    return c
+            for child in base.iterdir():
+                if child.is_dir() and (child / "api_v2.py").is_file() and (child / "webui.py").is_file():
+                    return child
     return None
 
 
@@ -96,84 +427,30 @@ GPT_DIRS = [
     "GPT_weights_v4", "GPT_weights_v2Pro", "GPT_weights_v2ProPlus",
 ]
 
-DEFAULT_STATE: dict[str, Any] = {
-    # 音色表：voice_id -> {model, gpt, sovits, ref_audio, ref_text, ref_lang, text_lang}
-    "voices": {},
-    "default_voice": None,
-}
+_ALIVE_CACHE = {"at": 0.0, "value": False}
 
 
-# ----------------------------------------------------------------------------
-# 状态
-# ----------------------------------------------------------------------------
+def upstream_base(cfg: Dict[str, Any]) -> str:
+    base = str(cfg["upstream"].get("base") or "").strip()
+    if base:
+        return base.rstrip("/")
+    return f"http://{cfg['upstream'].get('api_host', '127.0.0.1')}:{int(cfg['upstream'].get('api_port', 9880))}"
 
 
-def load_state() -> dict[str, Any]:
-    if STATE_FILE.is_file():
-        try:
-            s = json.loads(STATE_FILE.read_text(encoding="utf-8"))
-            s.setdefault("voices", {})
-            s.setdefault("default_voice", None)
-            return s
-        except Exception:
-            pass
-    return json.loads(json.dumps(DEFAULT_STATE))
-
-
-def save_state(s: dict[str, Any]) -> None:
-    STATE_FILE.write_text(json.dumps(s, ensure_ascii=False, indent=2), encoding="utf-8")
-
-
-def upstream_alive(timeout: float = 2.0) -> bool:
+def upstream_alive(timeout: float = 2.0, cache_seconds: float = 2.0) -> bool:
+    now = time.time()
+    if now - _ALIVE_CACHE["at"] < cache_seconds:
+        return bool(_ALIVE_CACHE["value"])
     try:
-        return requests.get(f"{UPSTREAM}/docs", timeout=timeout).status_code == 200
+        alive = requests.get(f"{upstream_base(load_config())}/docs", timeout=timeout).status_code == 200
     except Exception:
-        return False
+        alive = False
+    _ALIVE_CACHE.update({"at": now, "value": alive})
+    return alive
 
 
-# --- text language inference -------------------------------------------------
-# The OpenAI /v1/audio/speech schema has no field for the language of `input`,
-# so Amadeus's openai_compatible backend cannot transmit it: its payload is
-# only {model, input, voice, response_format, speed}. A GPT-SoVITS-class engine
-# selects its frontend from text_lang, so unconditionally reusing the voice's
-# configured language reads Japanese text with the Chinese frontend and drops
-# the kana. Infer it from the text instead, and keep the configured value as
-# the last resort. A voice can opt out with "auto_text_lang": false.
-_KANA_RE = re.compile(r'[\u3040-\u309f\u30a0-\u30ff]')
-_HAN_RE = re.compile(r'[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]')
-_LATIN_RE = re.compile(r'[A-Za-z]')
-
-
-def _detect_text_lang(text: str) -> str:
-    """Best-effort language of the text to synthesize: ja, zh, en or ''."""
-    value = str(text or '')
-    if _KANA_RE.search(value):
-        return 'ja'
-    if _HAN_RE.search(value):
-        return 'zh'
-    if _LATIN_RE.search(value):
-        return 'en'
-    return ''
-
-def check_key(authorization: Optional[str], x_api_key: Optional[str]) -> None:
-    if not API_KEY:
-        return
-    token = ""
-    if authorization and authorization.lower().startswith("bearer "):
-        token = authorization[7:].strip()
-    elif x_api_key:
-        token = x_api_key.strip()
-    if not secrets.compare_digest(token, API_KEY):
-        raise HTTPException(401, "Invalid API key")
-
-
-def resolve_install_file(
-    relative_path: str,
-    *,
-    label: str,
-    extensions: tuple[str, ...],
-) -> Path:
-    """Resolve a runtime asset inside GPTSOVITS_HOME, rejecting path escapes."""
+def resolve_install_file(relative_path: str, *, label: str, extensions: Tuple[str, ...]) -> Path:
+    """校验运行时资产位于 GPT-SoVITS 目录内，拒绝路径逃逸。"""
     if not INSTALL:
         raise HTTPException(400, "未找到 GPT-SoVITS 安装目录，不能校验资产路径")
     raw = str(relative_path or "").strip()
@@ -186,53 +463,132 @@ def resolve_install_file(
     except ValueError:
         raise HTTPException(400, f"{label} 必须位于 GPT-SoVITS 目录内") from None
     if candidate.suffix.lower() not in extensions:
-        allowed = ", ".join(extensions)
-        raise HTTPException(400, f"{label} 扩展名必须是 {allowed}")
+        raise HTTPException(400, f"{label} 扩展名必须是 {', '.join(extensions)}")
     if not candidate.is_file():
         raise HTTPException(400, f"{label} 不存在: {raw}")
     return candidate
+
+
+def scan_weights() -> Dict[str, List[Dict[str, Any]]]:
+    out: Dict[str, List[Dict[str, Any]]] = {"SoVITS": [], "GPT": []}
+    if not INSTALL:
+        return out
+    for kind, dirs, ext in (("SoVITS", SOVITS_DIRS, ".pth"), ("GPT", GPT_DIRS, ".ckpt")):
+        for directory in dirs:
+            full = INSTALL / directory
+            if not full.is_dir():
+                continue
+            for item in sorted(full.iterdir()):
+                if item.is_file() and item.suffix.lower() == ext:
+                    out[kind].append(
+                        {
+                            "name": item.stem,
+                            "rel": f"{directory}/{item.name}",
+                            "size": item.stat().st_size,
+                            "mtime": int(item.stat().st_mtime),
+                        }
+                    )
+    return out
 
 
 # ----------------------------------------------------------------------------
 # 应用
 # ----------------------------------------------------------------------------
 
-app = FastAPI(title="GPT-SoVITS OpenAI Gateway", version="1.0.0")
+app = FastAPI(title="TTS Service", version=VERSION, docs_url=None, redoc_url=None)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=CORS_ORIGINS or ["*"], allow_methods=["*"], allow_headers=["*"],
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "DELETE", "PUT", "OPTIONS"],
+    allow_headers=["*"],
+    expose_headers=["x-request-id", "x-tts-ms", "x-tts-voice", "x-tts-chars"],
 )
 
 
-@app.get("/")
-def root(
-    authorization: Optional[str] = Header(default=None),
-    x_api_key: Optional[str] = Header(default=None),
-):
-    check_key(authorization, x_api_key)
-    s = load_state()
+def _public_base(cfg: Dict[str, Any], request: Optional[Request] = None) -> str:
+    configured = str(cfg["server"].get("public_base_url") or "").strip().rstrip("/")
+    if configured:
+        return configured
+    host = str(cfg["server"].get("host") or "")
+    port = int(cfg["server"].get("port") or 18080)
+    if host in ("", "0.0.0.0"):
+        if request is not None:
+            host = request.headers.get("host", "").split(":")[0] or "127.0.0.1"
+        else:
+            host = "127.0.0.1"
+    return f"http://{host}:{port}"
+
+
+def _mask(key: str) -> str:
+    if len(key) <= 12:
+        return "sk-…"
+    return f"{key[:6]}…{key[-4:]}"
+
+
+def _key_view(record: Dict[str, Any]) -> Dict[str, Any]:
+    key = str(record.get("key") or "")
     return {
-        "service": "GPT-SoVITS OpenAI Gateway",
-        "upstream": UPSTREAM,
-        "upstream_alive": upstream_alive(),
-        "auth_required": bool(API_KEY),
-        "voices": list(s["voices"].keys()),
-        "default_voice": s["default_voice"],
-        "endpoints": {
-            "speech": "POST /v1/audio/speech",
-            "voices": "GET|POST /v1/audio/voices",
-            "models": "GET /v1/models",
-            "health": "GET /healthz",
-        },
+        "id": record.get("id"),
+        "name": record.get("name"),
+        "mask": _mask(key),
+        "enabled": bool(record.get("enabled", True)),
+        "created_at": record.get("created_at"),
+        "last_used_at": record.get("last_used_at"),
+        "uses": record.get("uses") or 0,
+        "note": record.get("note") or "",
     }
 
 
+def _voice_view(vid: str, voice: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "id": vid,
+        "gpt": voice.get("gpt"),
+        "sovits": voice.get("sovits"),
+        "ref_audio": voice.get("ref_audio"),
+        "ref_text": voice.get("ref_text"),
+        "ref_lang": voice.get("ref_lang", "zh"),
+        "text_lang": voice.get("text_lang", voice.get("ref_lang", "zh")),
+        "speed": voice.get("speed", 1.0),
+        "auto_text_lang": bool(voice.get("auto_text_lang", True)),
+    }
+
+
+# ---------------------------------------------------------------- 公开探活
+
 @app.get("/healthz")
 def healthz():
-    return {"ok": True, "upstream_alive": upstream_alive(), "ts": int(time.time())}
+    cfg = load_config()
+    return {
+        "ok": True,
+        "service": SERVICE_NAME,
+        "version": VERSION,
+        "upstream": upstream_base(cfg),
+        "upstream_alive": upstream_alive(),
+        "ts": int(time.time()),
+    }
 
 
-# ---------------- 音色管理 ----------------
+@app.get("/")
+def index():
+    return RedirectResponse(url="/admin", status_code=307)
+
+
+# ---------------------------------------------------------------- OpenAI 兼容
+
+@app.get("/v1/models")
+def list_models(
+    authorization: Optional[str] = Header(default=None),
+    x_api_key: Optional[str] = Header(default=None),
+):
+    require_client(authorization, x_api_key)
+    cfg = load_config()
+    now = int(time.time())
+    data: List[Dict[str, Any]] = []
+    for vid in cfg.get("voices") or {}:
+        data.append({"id": vid, "object": "model", "created": now, "owned_by": SERVICE_NAME})
+    data.append({"id": "tts-1", "object": "model", "created": now, "owned_by": SERVICE_NAME})
+    return {"object": "list", "data": data}
 
 
 @app.get("/v1/audio/voices")
@@ -240,45 +596,339 @@ def list_voices(
     authorization: Optional[str] = Header(default=None),
     x_api_key: Optional[str] = Header(default=None),
 ):
-    check_key(authorization, x_api_key)
-    s = load_state()
+    require_client(authorization, x_api_key)
+    cfg = load_config()
     return {
-        "default": s["default_voice"],
+        "default": cfg["defaults"].get("voice"),
         "voices": [
-            {"id": vid, **{k: v for k, v in v.items() if k != "model"}}
-            for vid, v in s["voices"].items()
+            {"id": vid, "ref_lang": v.get("ref_lang", "zh"), "speed": v.get("speed", 1.0)}
+            for vid, v in (cfg.get("voices") or {}).items()
         ],
     }
 
 
-@app.post("/v1/audio/voices")
-def upsert_voice(
-    payload: dict = Body(...),
+def _speech_payload(
+    payload: Dict[str, Any], cfg: Dict[str, Any]
+) -> Tuple[str, Dict[str, Any], str]:
+    text = str(payload.get("input") or payload.get("text") or "").strip()
+    if not text:
+        raise HTTPException(400, "input is required")
+    max_chars = int(cfg["limits"].get("max_input_chars") or 2000)
+    if len(text) > max_chars:
+        raise HTTPException(413, f"input 过长（{len(text)} 字符，上限 {max_chars}）")
+
+    voices: Dict[str, Any] = cfg.get("voices") or {}
+    vid = str(payload.get("voice") or payload.get("voice_id") or cfg["defaults"].get("voice") or "").strip()
+    if vid and vid in voices:
+        voice_cfg = dict(voices[vid])
+    elif payload.get("ref_audio"):
+        resolve_install_file(
+            payload["ref_audio"],
+            label="临时参考音频",
+            extensions=(".wav", ".mp3", ".flac", ".m4a", ".ogg"),
+        )
+        voice_cfg = {
+            "gpt": None,
+            "sovits": None,
+            "ref_audio": payload["ref_audio"],
+            "ref_text": payload.get("ref_text", ""),
+            "ref_lang": payload.get("prompt_lang", "zh"),
+            "text_lang": str(payload.get("text_lang") or "").strip(),
+            "speed": 1.0,
+        }
+    else:
+        known = ", ".join(list(voices.keys())[:8]) or "无"
+        raise HTTPException(400, f"没有可用音色（可用: {known}）。请先在配置界面注册音色。")
+
+    if not voice_cfg.get("ref_text"):
+        raise HTTPException(400, f"音色 '{vid}' 缺少 ref_text（参考音频原文）")
+
+    fmt = str(payload.get("response_format") or cfg["defaults"].get("response_format") or "wav").lower()
+    if fmt == "mp3":
+        fmt = "aac"  # 上游只支持 wav/raw/ogg/aac
+    if fmt not in ("wav", "raw", "ogg", "aac"):
+        raise HTTPException(400, f"不支持的 response_format: {fmt}")
+
+    text_lang = str(payload.get("text_lang") or "").strip()
+    if not text_lang:
+        if voice_cfg.get("auto_text_lang", True):
+            text_lang = _detect_text_lang(text)
+        text_lang = text_lang or voice_cfg.get("text_lang") or "zh"
+
+    body = {
+        "text": text,
+        "text_lang": text_lang,
+        "ref_audio_path": voice_cfg["ref_audio"],
+        "prompt_text": voice_cfg["ref_text"],
+        "prompt_lang": str(payload.get("prompt_lang") or voice_cfg.get("ref_lang") or "zh"),
+        "top_k": payload.get("top_k", 15),
+        "top_p": payload.get("top_p", 1),
+        "temperature": payload.get("temperature", 1),
+        "text_split_method": payload.get("text_split_method", "cut5"),
+        "batch_size": 1,
+        "speed_factor": float(payload.get("speed") or voice_cfg.get("speed") or cfg["defaults"].get("speed") or 1.0),
+        "repetition_penalty": payload.get("repetition_penalty", 1.35),
+        "seed": payload.get("seed", -1),
+        "media_type": fmt,
+        # 上游流式在网关这一跳被收齐后整段返回；不冒充流式。
+        "streaming_mode": 0,
+    }
+    return text, body, fmt
+
+
+MIME = {
+    "wav": "audio/wav",
+    "raw": "application/octet-stream",
+    "ogg": "audio/ogg",
+    "aac": "audio/aac",
+}
+
+
+@app.post("/v1/audio/speech")
+def speech(
+    payload: Dict[str, Any] = Body(...),
     authorization: Optional[str] = Header(default=None),
     x_api_key: Optional[str] = Header(default=None),
 ):
-    """
-    注册/更新一个音色。客户端之后只需用 voice id 调用 /v1/audio/speech。
-    """
-    check_key(authorization, x_api_key)
+    """OpenAI 兼容语音合成。同步端点，由 FastAPI 放进线程池，不阻塞事件循环。"""
+    started = time.time()
+    client = require_client(authorization, x_api_key)
+    cfg = load_config()
+    voice = str(payload.get("voice") or cfg["defaults"].get("voice") or "")
+    text, upstream_body, fmt = _speech_payload(payload, cfg)
 
-    vid = (payload.get("id") or "").strip()
-    if not vid:
-        raise HTTPException(400, "id is required (音色名)")
+    if not upstream_alive():
+        raise HTTPException(503, f"上游 TTS 未运行（{upstream_base(cfg)}）")
 
-    ref = (payload.get("ref_audio") or "").strip()
-    ref_text = (payload.get("ref_text") or "").strip()
-    if not ref:
-        raise HTTPException(400, "ref_audio is required（参考音频相对路径，如 output/x.wav）")
-    if not ref_text:
-        raise HTTPException(400, "ref_text is required（参考音频的原文，必须完全一致）")
+    acquired = _SLOTS.acquire(timeout=30)
+    if not acquired:
+        raise HTTPException(429, "服务繁忙：并发已满，请稍后重试")
+    try:
+        response = requests.post(
+            f"{upstream_base(cfg)}/tts",
+            json=upstream_body,
+            timeout=float(cfg["upstream"].get("timeout_seconds") or 600),
+        )
+    except Exception as error:  # noqa: BLE001
+        elapsed = int((time.time() - started) * 1000)
+        _record({
+            "ts": int(time.time()), "client": client.get("name"), "voice": voice,
+            "chars": len(text), "status": 502, "ms": elapsed, "bytes": 0,
+            "error": str(error)[:160],
+        })
+        raise HTTPException(502, f"调用上游失败: {error}") from error
+    finally:
+        _SLOTS.release()
 
-    resolve_install_file(
-        ref,
-        label="参考音频",
-        extensions=(".wav", ".mp3", ".flac", ".m4a", ".ogg"),
+    elapsed = int((time.time() - started) * 1000)
+    if response.status_code != 200:
+        _record({
+            "ts": int(time.time()), "client": client.get("name"), "voice": voice,
+            "chars": len(text), "status": response.status_code, "ms": elapsed,
+            "bytes": 0, "error": response.text[:160],
+        })
+        raise HTTPException(502, f"上游返回 {response.status_code}: {response.text[:300]}")
+
+    audio = response.content
+    _record({
+        "ts": int(time.time()), "client": client.get("name"), "voice": voice,
+        "chars": len(text), "status": 200, "ms": elapsed, "bytes": len(audio), "error": None,
+    })
+    return Response(
+        content=audio,
+        media_type=MIME.get(fmt, "audio/wav"),
+        headers={
+            "x-request-id": secrets.token_hex(6),
+            "x-tts-ms": str(elapsed),
+            "x-tts-voice": voice,
+            "x-tts-chars": str(len(text)),
+            "cache-control": "no-store",
+        },
     )
 
+
+# ---------------------------------------------------------------- 配置界面
+
+@app.get("/admin")
+def admin_page():
+    page = UI_DIR / "index.html"
+    if not page.is_file():
+        raise HTTPException(500, f"配置界面缺失: {page}")
+    return FileResponse(page, media_type="text/html; charset=utf-8", headers={"cache-control": "no-store"})
+
+
+@app.get("/admin/app.css")
+def admin_css():
+    return FileResponse(
+        UI_DIR / "app.css", media_type="text/css; charset=utf-8", headers={"cache-control": "no-store"}
+    )
+
+
+@app.get("/admin/app.js")
+def admin_js():
+    return FileResponse(
+        UI_DIR / "app.js",
+        media_type="application/javascript; charset=utf-8",
+        headers={"cache-control": "no-store"},
+    )
+
+
+@app.get("/favicon.ico")
+def favicon():
+    return Response(status_code=204)
+
+
+# ---------------------------------------------------------------- 管理 API
+
+@app.get("/admin/api/session")
+def api_session(request: Request):
+    cfg = load_config()
+    token = _admin_token(request)
+    return {
+        "authenticated": session_valid(token, cfg),
+        "needs_setup": not bool(cfg["auth"].get("admin_password_hash")),
+        "service": SERVICE_NAME,
+        "version": VERSION,
+    }
+
+
+@app.post("/admin/api/setup")
+def api_setup(payload: Dict[str, Any] = Body(...), request: Request = None):
+    cfg = load_config()
+    if cfg["auth"].get("admin_password_hash"):
+        raise HTTPException(400, "管理员口令已设置，不能重复初始化")
+    client_host = (request.client.host if request.client else "") or ""
+    if not cfg["auth"].get("allow_remote_setup") and client_host not in ("127.0.0.1", "::1"):
+        raise HTTPException(403, "只允许在本机完成初始化；请在服务器上打开配置界面")
+    password = str(payload.get("password") or "")
+    if len(password) < 8:
+        raise HTTPException(400, "管理员口令至少 8 位")
+    cfg["auth"]["admin_password_hash"] = hash_password(password)
+    save_config(cfg)
+    token, ttl = issue_session(cfg)
+    response = JSONResponse({"ok": True, "token": token, "expires_in": ttl})
+    _set_cookie(response, token, ttl)
+    return response
+
+
+def _set_cookie(response: Response, token: str, ttl: int) -> None:
+    response.set_cookie(
+        ADMIN_COOKIE, token, max_age=ttl, httponly=True, samesite="lax", path="/"
+    )
+
+
+@app.post("/admin/api/login")
+def api_login(payload: Dict[str, Any] = Body(...)):
+    cfg = load_config()
+    password = str(payload.get("password") or "")
+    if not cfg["auth"].get("admin_password_hash"):
+        raise HTTPException(400, "尚未设置管理员口令")
+    if not verify_password(password, cfg["auth"]["admin_password_hash"]):
+        time.sleep(0.4)  # 轻微延迟，降低暴力尝试速率
+        raise HTTPException(401, "口令错误")
+    token, ttl = issue_session(cfg)
+    response = JSONResponse({"ok": True, "token": token, "expires_in": ttl})
+    _set_cookie(response, token, ttl)
+    return response
+
+
+@app.post("/admin/api/logout")
+def api_logout(request: Request):
+    response = JSONResponse({"ok": True})
+    response.delete_cookie(ADMIN_COOKIE, path="/")
+    return response
+
+
+@app.post("/admin/api/password")
+def api_password(request: Request, payload: Dict[str, Any] = Body(...)):
+    require_admin(request)
+    cfg = load_config()
+    current = str(payload.get("current") or "")
+    new = str(payload.get("password") or "")
+    if not verify_password(current, cfg["auth"].get("admin_password_hash", "")):
+        raise HTTPException(401, "当前口令错误")
+    if len(new) < 8:
+        raise HTTPException(400, "新口令至少 8 位")
+    cfg["auth"]["admin_password_hash"] = hash_password(new)
+    save_config(cfg)
+    return {"ok": True}
+
+
+@app.get("/admin/api/overview")
+def api_overview(request: Request):
+    require_admin(request)
+    cfg = load_config()
+    with STATS_LOCK:
+        stats = dict(STATS)
+        recent = list(RECENT)[:20]
+    keys = cfg.get("keys") or []
+    return {
+        "service": SERVICE_NAME,
+        "version": VERSION,
+        "listen": {"host": cfg["server"].get("host"), "port": cfg["server"].get("port")},
+        "public_base_url": _public_base(cfg, request),
+        "upstream": {
+            "base": upstream_base(cfg),
+            "alive": upstream_alive(cache_seconds=0),
+            "managed": PROC["popen"] is not None and PROC["popen"].poll() is None,
+            "pid": PROC["popen"].pid if PROC["popen"] is not None and PROC["popen"].poll() is None else None,
+            "started_at": PROC["started_at"],
+            "install": str(INSTALL) if INSTALL else None,
+        },
+        "defaults": cfg["defaults"],
+        "counts": {
+            "voices": len(cfg.get("voices") or {}),
+            "keys": len(keys),
+            "keys_enabled": sum(1 for k in keys if k.get("enabled", True)),
+            "speech_requests": stats["speech_requests"],
+            "speech_ok": stats["speech_ok"],
+            "speech_failed": stats["speech_failed"],
+            "chars": stats["chars"],
+            "bytes": stats["bytes"],
+            "uptime_seconds": int(time.time() - stats["started_at"]),
+        },
+        "checks": {
+            "has_admin_password": bool(cfg["auth"].get("admin_password_hash")),
+            "has_client_key": any(k.get("enabled", True) for k in keys),
+            "install_found": INSTALL is not None,
+        },
+        "recent": recent,
+    }
+
+
+@app.get("/admin/api/requests")
+def api_requests(request: Request, limit: int = 50):
+    require_admin(request)
+    with STATS_LOCK:
+        return {"requests": list(RECENT)[: max(1, min(int(limit), 100))]}
+
+
+# ---- 音色
+
+@app.get("/admin/api/voices")
+def api_voices(request: Request):
+    require_admin(request)
+    cfg = load_config()
+    return {
+        "default": cfg["defaults"].get("voice"),
+        "voices": [_voice_view(vid, v) for vid, v in (cfg.get("voices") or {}).items()],
+        "weights": scan_weights(),
+    }
+
+
+@app.post("/admin/api/voices")
+def api_upsert_voice(request: Request, payload: Dict[str, Any] = Body(...)):
+    require_admin(request)
+    vid = str(payload.get("id") or "").strip()
+    if not vid:
+        raise HTTPException(400, "id 不能为空")
+    if not re.fullmatch(r"[\w.\-]{1,48}", vid):
+        raise HTTPException(400, "id 只能用字母、数字、下划线、点、短横线，长度 1-48")
+    ref_audio = str(payload.get("ref_audio") or "").strip()
+    ref_text = str(payload.get("ref_text") or "").strip()
+    if not ref_audio or not ref_text:
+        raise HTTPException(400, "ref_audio 与 ref_text 都是必填")
+    resolve_install_file(ref_audio, label="参考音频", extensions=(".wav", ".mp3", ".flac", ".m4a", ".ogg"))
     gpt = payload.get("gpt") or None
     sovits = payload.get("sovits") or None
     if gpt:
@@ -286,324 +936,358 @@ def upsert_voice(
     if sovits:
         resolve_install_file(sovits, label="SoVITS 权重", extensions=(".pth",))
 
-    s = load_state()
-    s["voices"][vid] = {
+    cfg = load_config()
+    cfg.setdefault("voices", {})[vid] = {
         "gpt": gpt,
         "sovits": sovits,
-        "ref_audio": ref,
+        "ref_audio": ref_audio,
         "ref_text": ref_text,
-        "ref_lang": payload.get("ref_lang", "zh"),
-        "text_lang": payload.get("text_lang", payload.get("ref_lang", "zh")),
-        "speed": float(payload.get("speed", 1.0)),
+        "ref_lang": str(payload.get("ref_lang") or "zh"),
+        "text_lang": str(payload.get("text_lang") or payload.get("ref_lang") or "zh"),
+        "speed": float(payload.get("speed") or 1.0),
+        "auto_text_lang": bool(payload.get("auto_text_lang", True)),
     }
-    if not s["default_voice"]:
-        s["default_voice"] = vid
-    save_state(s)
-    return {"ok": True, "voice": vid, "default": s["default_voice"]}
+    if not cfg["defaults"].get("voice"):
+        cfg["defaults"]["voice"] = vid
+    save_config(cfg)
+    return {"ok": True, "voice": vid, "default": cfg["defaults"].get("voice")}
 
 
-@app.post("/v1/audio/voices/default")
-def set_default_voice(
-    payload: dict = Body(...),
-    authorization: Optional[str] = Header(default=None),
-    x_api_key: Optional[str] = Header(default=None),
-):
-    check_key(authorization, x_api_key)
-    vid = (payload.get("id") or "").strip()
-    s = load_state()
-    if vid not in s["voices"]:
+@app.post("/admin/api/voices/default")
+def api_default_voice(request: Request, payload: Dict[str, Any] = Body(...)):
+    require_admin(request)
+    vid = str(payload.get("id") or "").strip()
+    cfg = load_config()
+    if vid not in (cfg.get("voices") or {}):
         raise HTTPException(404, f"音色不存在: {vid}")
-    s["default_voice"] = vid
-    save_state(s)
+    cfg["defaults"]["voice"] = vid
+    save_config(cfg)
     return {"ok": True, "default": vid}
 
 
-@app.delete("/v1/audio/voices/{vid}")
-def delete_voice(
-    vid: str,
-    authorization: Optional[str] = Header(default=None),
-    x_api_key: Optional[str] = Header(default=None),
-):
-    check_key(authorization, x_api_key)
-    s = load_state()
-    if vid not in s["voices"]:
+@app.delete("/admin/api/voices/{vid}")
+def api_delete_voice(request: Request, vid: str):
+    require_admin(request)
+    cfg = load_config()
+    voices = cfg.get("voices") or {}
+    if vid not in voices:
         raise HTTPException(404, "音色不存在")
-    del s["voices"][vid]
-    if s["default_voice"] == vid:
-        s["default_voice"] = next(iter(s["voices"]), None)
-    save_state(s)
+    voices.pop(vid)
+    if cfg["defaults"].get("voice") == vid:
+        cfg["defaults"]["voice"] = next(iter(voices), None)
+    save_config(cfg)
     return {"ok": True}
 
 
-# ---------------- OpenAI 兼容 ----------------
+# ---- 客户端密钥
 
-
-@app.get("/v1/models")
-def list_models(
-    authorization: Optional[str] = Header(default=None),
-    x_api_key: Optional[str] = Header(default=None),
-):
-    """OpenAI 兼容模型列表。"""
-    check_key(authorization, x_api_key)
-    s = load_state()
-    scanned = scan_weights()
-    now = int(time.time())
-    data = []
-    for vid in s["voices"]:
-        data.append({"id": vid, "object": "model", "created": now, "owned_by": "gpt-sovits"})
-    for kind, items in scanned.items():
-        for it in items:
-            if it["builtin"]:
-                continue
-            data.append({
-                "id": f"{kind.lower()}:{it['name']}",
-                "object": "model", "created": it["mtime"], "owned_by": "gpt-sovits",
-            })
-    if not data:
-        data.append({"id": "gpt-sovits", "object": "model", "created": now, "owned_by": "gpt-sovits"})
-    return {"object": "list", "data": data}
-
-
-def scan_weights() -> dict[str, list[dict[str, Any]]]:
-    out: dict[str, list[dict[str, Any]]] = {"SoVITS": [], "GPT": []}
-    if not INSTALL:
-        return out
-    for kind, dirs, ext in (("SoVITS", SOVITS_DIRS, ".pth"), ("GPT", GPT_DIRS, ".ckpt")):
-        for d in dirs:
-            full = INSTALL / d
-            if not full.is_dir():
-                continue
-            for f in sorted(full.iterdir()):
-                if f.is_file() and f.suffix.lower() == ext:
-                    out[kind].append({
-                        "name": f.stem, "rel": f"{d}/{f.name}",
-                        "size": f.stat().st_size, "mtime": int(f.stat().st_mtime),
-                        "builtin": False,
-                    })
-    return out
-
-
-@app.post("/v1/audio/speech")
-async def speech(
-    request: Request,
-    payload: dict = Body(...),
-    authorization: Optional[str] = Header(default=None),
-    x_api_key: Optional[str] = Header(default=None),
-):
-    """
-    OpenAI 兼容语音合成。
-
-    请求体：
-      {
-        "input": "要说的文字",          # 必填（兼容 "text"）
-        "voice": "音色名",              # 可选，缺省用默认音色
-        "response_format": "wav",       # 可选，wav|mp3|opus|aac|flac|pcm
-        "speed": 1.0,                   # 可选
-        "__ref_audio": "output/x.wav",  # 可选，临时指定参考音频（无需预注册）
-        "__ref_text": "...",            # 与上面配对
-        "__prompt_lang": "zh"
-      }
-    """
-    check_key(authorization, x_api_key)
-
-    if not upstream_alive():
-        raise HTTPException(503, f"上游 TTS 服务未运行（{UPSTREAM}）。请先启动 api_v2.py")
-
-    text = (payload.get("input") or payload.get("text") or "").strip()
-    if not text:
-        raise HTTPException(400, "input is required")
-
-    s = load_state()
-    vid = (payload.get("voice") or payload.get("voice_id") or s["default_voice"] or "").strip()
-
-    cfg: dict[str, Any]
-    if vid and vid in s["voices"]:
-        cfg = dict(s["voices"][vid])
-    elif payload.get("__ref_audio"):
-        resolve_install_file(
-            payload["__ref_audio"],
-            label="临时参考音频",
-            extensions=(".wav", ".mp3", ".flac", ".m4a", ".ogg"),
-        )
-        cfg = {
-            "gpt": None, "sovits": None,
-            "ref_audio": payload["__ref_audio"],
-            "ref_text": payload.get("__ref_text", ""),
-            "ref_lang": payload.get("__prompt_lang", "zh"),
-            "text_lang": (payload.get("text_lang") or "").strip()
-                or _detect_text_lang(text)
-                or payload.get("__prompt_lang", "zh"),
-            "speed": 1.0,
-        }
-    else:
-        raise HTTPException(
-            400,
-            "没有可用音色。请先 POST /v1/audio/voices 注册，或在请求里带 __ref_audio/__ref_text。"
-            + (f"（当前音色: {list(s['voices'].keys())}）" if s["voices"] else ""),
-        )
-
-    if not cfg.get("ref_text"):
-        raise HTTPException(400, f"音色 '{vid}' 缺少 ref_text（参考音频原文）")
-
-    fmt = (payload.get("response_format") or "wav").lower()
-    if fmt == "mp3":
-        fmt = "aac"  # 上游只支持 wav/raw/ogg/aac
-
-    body = {
-        "text": text,
-        "text_lang": (payload.get("text_lang") or "").strip()
-        or (_detect_text_lang(text) if cfg.get("auto_text_lang", True) else "")
-        or cfg.get("text_lang", "zh"),
-        "ref_audio_path": cfg["ref_audio"],
-        "prompt_text": cfg["ref_text"],
-        "prompt_lang": payload.get("prompt_lang") or cfg.get("ref_lang", "zh"),
-        "top_k": payload.get("top_k", 15),
-        "top_p": payload.get("top_p", 1),
-        "temperature": payload.get("temperature", 1),
-        "text_split_method": payload.get("text_split_method", "cut5"),
-        "batch_size": 1,
-        "speed_factor": float(payload.get("speed") or cfg.get("speed") or 1.0),
-        "repetition_penalty": payload.get("repetition_penalty", 1.35),
-        "seed": payload.get("seed", -1),
-        "media_type": fmt,
-        "streaming_mode": bool(payload.get("stream", False)),
-    }
-
-    try:
-        r = requests.post(f"{UPSTREAM}/tts", json=body,
-                          timeout=float(payload.get("timeout", 600)))
-    except Exception as e:  # noqa: BLE001
-        raise HTTPException(502, f"调用上游失败: {e}") from e
-
-    if r.status_code != 200:
-        raise HTTPException(r.status_code, f"上游返回: {r.text[:300]}")
-
-    mime = {
-        "wav": "audio/wav", "raw": "application/octet-stream",
-        "ogg": "audio/ogg", "aac": "audio/aac",
-    }.get(fmt, "audio/wav")
-
-    return Response(content=r.content, media_type=mime)
-
-
-# ----------------------------------------------------------------------------
-# 上游服务管理
-# ----------------------------------------------------------------------------
-
-PROC: dict[str, Any] = {"popen": None, "log": None, "started_at": None}
-
-
-@app.get("/admin/upstream/status")
-def upstream_status(
-    authorization: Optional[str] = Header(default=None),
-    x_api_key: Optional[str] = Header(default=None),
-):
-    check_key(authorization, x_api_key)
+def _new_key_record(name: str, note: str) -> Dict[str, Any]:
     return {
-        "upstream": UPSTREAM,
-        "alive": upstream_alive(),
-        "managed": PROC["popen"] is not None and PROC["popen"].poll() is None,
-        "started_at": PROC["started_at"],
-        "log_tail": _tail(40),
+        "id": secrets.token_hex(4),
+        "name": (name or "").strip() or "unnamed",
+        "key": "sk-" + secrets.token_hex(24),
+        "enabled": True,
+        "created_at": int(time.time()),
+        "last_used_at": None,
+        "uses": 0,
+        "note": (note or "").strip(),
     }
 
 
-def _tail(n: int = 40) -> list[str]:
-    if not INSTALL:
-        return []
-    p = INSTALL / "gateway_upstream.log"
-    if not p.is_file():
+@app.get("/admin/api/keys")
+def api_keys(request: Request):
+    require_admin(request)
+    cfg = load_config()
+    return {"keys": [_key_view(k) for k in (cfg.get("keys") or [])]}
+
+
+@app.post("/admin/api/keys")
+def api_create_key(request: Request, payload: Dict[str, Any] = Body(default={})):
+    require_admin(request)
+    cfg = load_config()
+    record = _new_key_record(payload.get("name"), payload.get("note"))
+    cfg.setdefault("keys", []).append(record)
+    save_config(cfg)
+    # 明文只在创建时返回一次
+    return {"ok": True, "key": record["key"], "record": _key_view(record)}
+
+
+@app.put("/admin/api/keys/{kid}")
+def api_update_key(request: Request, kid: str, payload: Dict[str, Any] = Body(...)):
+    require_admin(request)
+    cfg = load_config()
+    for record in cfg.get("keys") or []:
+        if record.get("id") == kid:
+            if "name" in payload:
+                record["name"] = str(payload["name"]).strip() or record.get("name")
+            if "note" in payload:
+                record["note"] = str(payload["note"])
+            if "enabled" in payload:
+                record["enabled"] = bool(payload["enabled"])
+            save_config(cfg)
+            return {"ok": True, "record": _key_view(record)}
+    raise HTTPException(404, "密钥不存在")
+
+
+@app.post("/admin/api/keys/{kid}/reveal")
+def api_reveal_key(request: Request, kid: str):
+    require_admin(request)
+    cfg = load_config()
+    for record in cfg.get("keys") or []:
+        if record.get("id") == kid:
+            return {"key": record.get("key")}
+    raise HTTPException(404, "密钥不存在")
+
+
+@app.delete("/admin/api/keys/{kid}")
+def api_delete_key(request: Request, kid: str):
+    require_admin(request)
+    cfg = load_config()
+    keys = cfg.get("keys") or []
+    kept = [k for k in keys if k.get("id") != kid]
+    if len(kept) == len(keys):
+        raise HTTPException(404, "密钥不存在")
+    cfg["keys"] = kept
+    save_config(cfg)
+    return {"ok": True}
+
+
+# ---- 设置
+
+@app.get("/admin/api/settings")
+def api_settings(request: Request):
+    require_admin(request)
+    cfg = load_config()
+    return {
+        "server": cfg["server"],
+        "upstream": cfg["upstream"],
+        "defaults": cfg["defaults"],
+        "limits": cfg["limits"],
+        "auth": {
+            "session_hours": cfg["auth"].get("session_hours"),
+            "allow_remote_setup": bool(cfg["auth"].get("allow_remote_setup")),
+            "has_admin_password": bool(cfg["auth"].get("admin_password_hash")),
+        },
+        "install": str(INSTALL) if INSTALL else None,
+        "config_path": str(CONFIG_PATH),
+        "restart_fields": sorted(RESTART_FIELDS),
+    }
+
+
+@app.put("/admin/api/settings")
+def api_update_settings(request: Request, payload: Dict[str, Any] = Body(...)):
+    require_admin(request)
+    cfg = load_config()
+    restart_required: List[str] = []
+
+    def apply(section: str, key: str, value: Any) -> None:
+        if value is None:
+            return
+        cfg.setdefault(section, {})[key] = value
+        if f"{section}.{key}" in RESTART_FIELDS:
+            restart_required.append(f"{section}.{key}")
+
+    server = payload.get("server") or {}
+    if "host" in server:
+        host = str(server["host"]).strip()
+        if host not in ("0.0.0.0", "127.0.0.1", "localhost"):
+            raise HTTPException(400, "监听地址只支持 0.0.0.0 / 127.0.0.1 / localhost")
+        apply("server", "host", host)
+    if "port" in server:
+        apply("server", "port", int(server["port"]))
+    if "public_base_url" in server:
+        apply("server", "public_base_url", str(server["public_base_url"]).strip())
+
+    upstream = payload.get("upstream") or {}
+    for key in ("base", "api_host", "config_path", "log_path"):
+        if key in upstream:
+            apply("upstream", key, str(upstream[key]).strip())
+    if "api_port" in upstream:
+        apply("upstream", "api_port", int(upstream["api_port"]))
+    for key in ("timeout_seconds", "start_timeout_seconds"):
+        if key in upstream:
+            apply("upstream", key, int(upstream[key]))
+
+    defaults = payload.get("defaults") or {}
+    if "voice" in defaults:
+        voice = str(defaults["voice"] or "").strip() or None
+        if voice and voice not in (cfg.get("voices") or {}):
+            raise HTTPException(400, f"默认音色不存在: {voice}")
+        apply("defaults", "voice", voice)
+    if "response_format" in defaults:
+        apply("defaults", "response_format", str(defaults["response_format"]))
+    if "speed" in defaults:
+        apply("defaults", "speed", float(defaults["speed"]))
+
+    limits = payload.get("limits") or {}
+    if "max_input_chars" in limits:
+        apply("limits", "max_input_chars", max(1, int(limits["max_input_chars"])))
+    if "max_concurrent" in limits:
+        apply("limits", "max_concurrent", max(1, int(limits["max_concurrent"])))
+
+    auth = payload.get("auth") or {}
+    if "session_hours" in auth:
+        apply("auth", "session_hours", max(1, int(auth["session_hours"])))
+    if "allow_remote_setup" in auth:
+        cfg["auth"]["allow_remote_setup"] = bool(auth["allow_remote_setup"])
+
+    save_config(cfg)
+    return {"ok": True, "restart_required": sorted(set(restart_required))}
+
+
+# ---- 试听
+
+@app.post("/admin/api/test")
+def api_test(request: Request, payload: Dict[str, Any] = Body(...)):
+    require_admin(request)
+    cfg = load_config()
+    started = time.time()
+    text, upstream_body, fmt = _speech_payload(payload, cfg)
+    if not upstream_alive():
+        raise HTTPException(503, f"上游 TTS 未运行（{upstream_base(cfg)}）")
+    try:
+        response = requests.post(
+            f"{upstream_base(cfg)}/tts",
+            json=upstream_body,
+            timeout=float(cfg["upstream"].get("timeout_seconds") or 600),
+        )
+    except Exception as error:  # noqa: BLE001
+        raise HTTPException(502, f"调用上游失败: {error}") from error
+    if response.status_code != 200:
+        raise HTTPException(502, f"上游返回 {response.status_code}: {response.text[:300]}")
+    elapsed = int((time.time() - started) * 1000)
+    return Response(
+        content=response.content,
+        media_type=MIME.get(fmt, "audio/wav"),
+        headers={"x-tts-ms": str(elapsed), "cache-control": "no-store"},
+    )
+
+
+# ---- 上游进程
+
+PROC: Dict[str, Any] = {"popen": None, "log": None, "started_at": None}
+
+
+def _upstream_log_path(cfg: Dict[str, Any]) -> Optional[Path]:
+    configured = str(cfg["upstream"].get("log_path") or "").strip()
+    if configured:
+        return Path(configured)
+    for candidate in (
+        GATEWAY_DIR / "gateway_upstream.log",
+        (INSTALL / "gateway_upstream.log") if INSTALL else None,
+        (INSTALL.parent / "logs" / "gateway_upstream.log") if INSTALL else None,
+    ):
+        if candidate and candidate.is_file():
+            return candidate
+    return (GATEWAY_DIR / "gateway_upstream.log")
+
+
+def _tail(path: Optional[Path], n: int = 80) -> List[str]:
+    if path is None or not path.is_file():
         return []
     try:
-        return p.read_text(encoding="utf-8", errors="replace").splitlines()[-n:]
+        return path.read_text(encoding="utf-8", errors="replace").splitlines()[-n:]
     except Exception:
         return []
 
 
-@app.post("/admin/upstream/start")
-def upstream_start(
-    payload: dict = Body(default={}),
-    authorization: Optional[str] = Header(default=None),
-    x_api_key: Optional[str] = Header(default=None),
-):
-    check_key(authorization, x_api_key)
-    if upstream_alive():
+@app.get("/admin/api/upstream")
+def api_upstream(request: Request, tail: int = 40):
+    require_admin(request)
+    cfg = load_config()
+    return {
+        "base": upstream_base(cfg),
+        "alive": upstream_alive(cache_seconds=0),
+        "managed": PROC["popen"] is not None and PROC["popen"].poll() is None,
+        "pid": PROC["popen"].pid if PROC["popen"] is not None and PROC["popen"].poll() is None else None,
+        "started_at": PROC["started_at"],
+        "install": str(INSTALL) if INSTALL else None,
+        "log_path": str(_upstream_log_path(cfg)),
+        "log_tail": _tail(_upstream_log_path(cfg), max(1, min(int(tail), 400))),
+    }
+
+
+@app.post("/admin/api/upstream/start")
+def api_upstream_start(request: Request, payload: Dict[str, Any] = Body(default={})):
+    require_admin(request)
+    cfg = load_config()
+    if upstream_alive(cache_seconds=0):
         return {"ok": True, "already": True}
     if not INSTALL:
-        raise HTTPException(400, "未找到 GPT-SoVITS 安装目录")
+        raise HTTPException(400, "未找到 GPT-SoVITS 安装目录（设置 GPTSOVITS_HOME 或把它放在同目录）")
     python_candidates = [
         INSTALL / "runtime" / "python.exe",
         INSTALL / "runtime" / "python",
         INSTALL / ".venv" / "Scripts" / "python.exe",
         INSTALL / ".venv" / "bin" / "python",
     ]
-    py = next((candidate for candidate in python_candidates if candidate.is_file()), None)
-    if py is None:
+    python = next((c for c in python_candidates if c.is_file()), None)
+    if python is None:
         fallback = shutil.which("python3") or shutil.which("python")
         if fallback is None:
             raise HTTPException(400, "未找到 GPT-SoVITS 运行时 Python")
-        py = Path(fallback)
+        python = Path(fallback)
 
-    cfg = payload.get("config") or "GPT_SoVITS/configs/tts_infer.yaml"
-    resolve_install_file(cfg, label="上游配置", extensions=(".yaml", ".yml"))
-    logf = open(INSTALL / "gateway_upstream.log", "a", encoding="utf-8", buffering=1)
-    logf.write(f"\n=== gateway start {time.strftime('%Y-%m-%d %H:%M:%S')} ===\n")
-    p = subprocess.Popen(
-        [str(py), "api_v2.py", "-a", "127.0.0.1", "-p", str(UPSTREAM_PORT), "-c", cfg],
-        cwd=str(INSTALL), stdout=logf, stderr=subprocess.STDOUT,
+    config_rel = str(payload.get("config") or cfg["upstream"].get("config_path") or "GPT_SoVITS/configs/tts_infer.yaml")
+    resolve_install_file(config_rel, label="上游配置", extensions=(".yaml", ".yml"))
+    log_path = _upstream_log_path(cfg)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    log_file = open(log_path, "a", encoding="utf-8", buffering=1)
+    log_file.write(f"\n=== upstream start {time.strftime('%Y-%m-%d %H:%M:%S')} ===\n")
+    # 上游永远只监听回环地址：外部只认本服务。
+    host = str(cfg["upstream"].get("api_host") or "127.0.0.1")
+    port = str(int(cfg["upstream"].get("api_port") or 9880))
+    proc = subprocess.Popen(
+        [str(python), "api_v2.py", "-a", host, "-p", port, "-c", config_rel],
+        cwd=str(INSTALL),
+        stdout=log_file,
+        stderr=subprocess.STDOUT,
     )
-    PROC.update({"popen": p, "log": logf,
-                 "started_at": time.strftime("%Y-%m-%d %H:%M:%S")})
-
-    deadline = time.time() + 180
+    PROC.update({"popen": proc, "log": log_file, "started_at": time.strftime("%Y-%m-%d %H:%M:%S")})
+    deadline = time.time() + float(cfg["upstream"].get("start_timeout_seconds") or 180)
     while time.time() < deadline:
-        if upstream_alive(2):
-            return {"ok": True, "ready": True}
-        if p.poll() is not None:
-            raise HTTPException(500, f"进程退出 code={p.returncode}，见 gateway_upstream.log")
+        if upstream_alive(2, cache_seconds=0):
+            return {"ok": True, "ready": True, "pid": proc.pid}
+        if proc.poll() is not None:
+            raise HTTPException(500, f"上游进程退出 code={proc.returncode}，见 {log_path}")
         time.sleep(2)
-    return {"ok": True, "ready": False, "note": "仍在启动"}
+    return {"ok": True, "ready": False, "pid": proc.pid, "note": "仍在启动"}
 
 
-@app.post("/admin/upstream/stop")
-def upstream_stop(
-    authorization: Optional[str] = Header(default=None),
-    x_api_key: Optional[str] = Header(default=None),
-):
-    check_key(authorization, x_api_key)
-    p = PROC.get("popen")
-    if p is not None and p.poll() is None:
-        p.terminate()
+@app.post("/admin/api/upstream/stop")
+def api_upstream_stop(request: Request):
+    require_admin(request)
+    cfg = load_config()
+    proc = PROC.get("popen")
+    if proc is not None and proc.poll() is None:
+        proc.terminate()
         try:
-            p.wait(timeout=15)
+            proc.wait(timeout=15)
         except subprocess.TimeoutExpired:
-            p.kill()
-    if upstream_alive():
+            proc.kill()
+    if upstream_alive(cache_seconds=0):
         try:
-            requests.get(f"{UPSTREAM}/control", params={"command": "exit"}, timeout=10)
+            requests.get(f"{upstream_base(cfg)}/control", params={"command": "exit"}, timeout=10)
         except Exception:
             pass
-    if PROC.get("log"):
+    log_file = PROC.get("log")
+    if log_file:
         try:
-            PROC["log"].close()
+            log_file.close()
         except Exception:
             pass
     PROC.update({"popen": None, "log": None, "started_at": None})
     time.sleep(1)
-    return {"ok": True, "alive": upstream_alive()}
+    return {"ok": True, "alive": upstream_alive(cache_seconds=0)}
 
 
-@app.post("/admin/upstream/load")
-def upstream_load(
-    payload: dict = Body(...),
-    authorization: Optional[str] = Header(default=None),
-    x_api_key: Optional[str] = Header(default=None),
-):
-    """把某个模型的权重加载进上游服务（热切换）。"""
-    check_key(authorization, x_api_key)
-    if not upstream_alive():
+@app.post("/admin/api/upstream/load")
+def api_upstream_load(request: Request, payload: Dict[str, Any] = Body(...)):
+    require_admin(request)
+    cfg = load_config()
+    if not upstream_alive(cache_seconds=0):
         raise HTTPException(503, "上游未运行")
-    out: dict[str, Any] = {}
+    results: Dict[str, Any] = {}
     for key in ("gpt", "sovits"):
         rel = payload.get(key)
         if not rel:
@@ -611,29 +1295,72 @@ def upstream_load(
         extensions = (".ckpt",) if key == "gpt" else (".pth",)
         resolve_install_file(rel, label=f"{key} 权重", extensions=extensions)
         try:
-            r = requests.get(f"{UPSTREAM}/set_{key}_weights",
-                             params={"weights_path": rel}, timeout=180)
-            out[key] = {"ok": r.status_code == 200, "status": r.status_code, "body": r.text[:200]}
-        except Exception as e:  # noqa: BLE001
-            out[key] = {"ok": False, "error": str(e)}
-    if out and not any(v.get("ok") for v in out.values()):
-        raise HTTPException(400, f"加载失败: {out}")
-    return {"ok": True, "results": out}
+            response = requests.get(
+                f"{upstream_base(cfg)}/set_{key}_weights", params={"weights_path": rel}, timeout=180
+            )
+            results[key] = {
+                "ok": response.status_code == 200,
+                "status": response.status_code,
+                "body": response.text[:200],
+            }
+        except Exception as error:  # noqa: BLE001
+            results[key] = {"ok": False, "error": str(error)}
+    if results and not any(v.get("ok") for v in results.values()):
+        raise HTTPException(400, f"加载失败: {results}")
+    return {"ok": True, "results": results}
+
+
+@app.post("/admin/api/restart")
+def api_restart(request: Request):
+    require_admin(request)
+
+    def _exit_soon() -> None:
+        time.sleep(0.4)
+        os._exit(EXIT_RESTART)
+
+    threading.Thread(target=_exit_soon, daemon=True).start()
+    return {"ok": True, "restarting": True}
+
+
+# ----------------------------------------------------------------------------
+# 启动
+# ----------------------------------------------------------------------------
+
+def _reset_slots() -> None:
+    global _SLOTS
+    cfg = load_config()
+    _SLOTS = threading.BoundedSemaphore(max(1, int(cfg["limits"].get("max_concurrent") or 2)))
+
+
+def main() -> None:
+    cfg = bootstrap_config()
+    _reset_slots()
+    threading.Thread(target=_flush_loop, daemon=True).start()
+
+    host = str(cfg["server"].get("host") or "0.0.0.0")
+    port = int(cfg["server"].get("port") or 18080)
+
+    print("=" * 68)
+    print(f" TTS Service v{VERSION}")
+    print("=" * 68)
+    print(f" 配置文件   : {CONFIG_PATH}")
+    print(f" 安装目录   : {INSTALL or '【未找到】'}")
+    print(f" 监听       : http://{host}:{port}")
+    print(f" 配置界面   : http://127.0.0.1:{port}/admin")
+    print(f" OpenAI     : POST http://<服务器IP>:{port}/v1/audio/speech")
+    print(f" 上游 TTS   : {upstream_base(cfg)}")
+    print(f" 客户端密钥 : {len(cfg.get('keys') or [])} 把")
+    print(f" 管理员口令 : {'已设置' if cfg['auth'].get('admin_password_hash') else '【未设置】'}")
+    print("=" * 68)
+
+    if host not in ("127.0.0.1", "localhost", "::1"):
+        if not cfg["auth"].get("admin_password_hash"):
+            raise SystemExit("拒绝在非回环地址上启动：请先设置管理员口令（TTS_ADMIN_PASSWORD）")
+        if not any(k.get("enabled", True) for k in (cfg.get("keys") or [])):
+            raise SystemExit("拒绝在非回环地址上启动：请先创建至少一把客户端密钥")
+
+    uvicorn.run(app, host=host, port=port, log_level="info")
 
 
 if __name__ == "__main__":
-    print("=" * 66)
-    print(" GPT-SoVITS OpenAI Gateway")
-    print("=" * 66)
-    print(f" 安装目录 : {INSTALL or '【未找到】'}")
-    print(f" 网关地址 : http://{HOST}:{PORT}")
-    print(f" OpenAI   : POST http://<你的IP>:{PORT}/v1/audio/speech")
-    print(f" 上游 TTS : {UPSTREAM}")
-    print(f" 鉴权     : {'已启用 API Key' if API_KEY else '未启用（仅限回环地址）'}")
-    print("=" * 66)
-    if not API_KEY and HOST not in {"127.0.0.1", "localhost", "::1"}:
-        raise SystemExit(
-            "拒绝在非回环地址上无鉴权启动。请设置 GATEWAY_API_KEY，"
-            "或把 GATEWAY_HOST 改为 127.0.0.1。"
-        )
-    uvicorn.run(app, host=HOST, port=PORT, log_level="info")
+    main()

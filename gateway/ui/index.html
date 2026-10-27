@@ -1,0 +1,86 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TTS Service · 配置界面</title>
+<link rel="stylesheet" href="/admin/app.css">
+</head>
+<body>
+
+<div id="gate" class="gate" hidden>
+  <form id="gate-form" class="gate-card" autocomplete="off">
+    <div class="gate-title">TTS Service</div>
+    <div id="gate-sub" class="p-text-sm fg-muted">配置界面</div>
+    <label class="field">
+      <span id="gate-label">管理员口令</span>
+      <input id="gate-password" class="input" type="password" autocomplete="current-password" required>
+    </label>
+    <button id="gate-submit" class="btn btn-primary btn-block" type="submit">进入</button>
+    <p id="gate-error" class="p-text-sm danger" role="alert"></p>
+  </form>
+</div>
+
+<div id="shell" class="shell" hidden>
+  <header class="topbar">
+    <div class="brand">
+      <span class="brand-mark" aria-hidden="true">TTS</span>
+      <span class="brand-name">TTS Service</span>
+      <span class="brand-sep">/</span>
+      <span id="brand-page" class="brand-page">概览</span>
+    </div>
+    <div class="topbar-right">
+      <span id="pill-upstream" class="badge"><span class="dot"></span><span>上游</span></span>
+      <span id="pill-listen" class="badge mono"></span>
+      <button id="btn-theme" class="btn btn-sm" type="button" title="切换明暗主题" aria-label="切换明暗主题">◐</button>
+      <button id="btn-logout" class="btn btn-sm" type="button">登出</button>
+    </div>
+  </header>
+
+  <div class="body">
+    <nav class="sidenav" aria-label="主导航">
+      <div class="nav-group">
+        <div class="nav-title">运行</div>
+        <a class="nav-item" href="#/overview" data-page="overview" title="概览">概览</a>
+        <a class="nav-item" href="#/requests" data-page="requests" title="最近请求">最近请求</a>
+        <a class="nav-item" href="#/upstream" data-page="upstream" title="上游进程">上游进程</a>
+      </div>
+      <div class="nav-group">
+        <div class="nav-title">服务内容</div>
+        <a class="nav-item" href="#/voices" data-page="voices" title="音色">音色</a>
+        <a class="nav-item" href="#/keys" data-page="keys" title="客户端密钥">客户端密钥</a>
+      </div>
+      <div class="nav-group">
+        <div class="nav-title">配置</div>
+        <a class="nav-item" href="#/settings" data-page="settings" title="服务设置">服务设置</a>
+        <a class="nav-item" href="#/security" data-page="security" title="安全">安全</a>
+        <a class="nav-item" href="#/guide" data-page="guide" title="接入示例">接入示例</a>
+      </div>
+    </nav>
+
+    <main id="view" class="content" tabindex="-1"></main>
+  </div>
+
+  <footer class="statusbar">
+    <span id="status-left" class="mono">—</span>
+    <span class="spacer"></span>
+    <span id="status-right" class="mono">—</span>
+  </footer>
+</div>
+
+<dialog id="modal" class="modal">
+  <div class="modal-form">
+    <h2 id="modal-title" class="modal-title">标题</h2>
+    <div id="modal-body" class="modal-body"></div>
+    <div class="modal-actions">
+      <button id="modal-cancel" class="btn" type="button">取消</button>
+      <button id="modal-ok" class="btn btn-primary" type="button">确定</button>
+    </div>
+  </div>
+</dialog>
+
+<div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
+
+<script src="/admin/app.js"></script>
+</body>
+</html>
