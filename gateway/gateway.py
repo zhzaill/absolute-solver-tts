@@ -437,7 +437,11 @@ def upstream_base(cfg: Dict[str, Any]) -> str:
     return f"http://{cfg['upstream'].get('api_host', '127.0.0.1')}:{int(cfg['upstream'].get('api_port', 9880))}"
 
 
-def upstream_alive(timeout: float = 2.0, cache_seconds: float = 2.0) -> bool:
+def upstream_alive(timeout: float = 3.0, cache_seconds: float = 5.0) -> bool:
+    """仅供探活与界面显示：GPU 正在合成时 /docs 可能慢，超时给足并缓存。
+
+    合成路径**不**依赖它——那里直接打上游，按真实异常分类（见 `_call_upstream`）。
+    """
     now = time.time()
     if now - _ALIVE_CACHE["at"] < cache_seconds:
         return bool(_ALIVE_CACHE["value"])
@@ -447,6 +451,26 @@ def upstream_alive(timeout: float = 2.0, cache_seconds: float = 2.0) -> bool:
         alive = False
     _ALIVE_CACHE.update({"at": now, "value": alive})
     return alive
+
+
+def _call_upstream(cfg: Dict[str, Any], body: Dict[str, Any]) -> requests.Response:
+    """合成调用只在这里发出；把传输层异常翻译成可诊断的 HTTP 错误。
+
+    2026-10-27 修：原先合成前先探 /docs，并发合成时该探针 2 秒超时会导致整段
+    被误判为"上游未运行"（实测 5 段里丢掉 1 段）。探测只用于展示，不再拦截请求。
+    """
+    try:
+        return requests.post(
+            f"{upstream_base(cfg)}/tts",
+            json=body,
+            timeout=float(cfg["upstream"].get("timeout_seconds") or 600),
+        )
+    except requests.exceptions.Timeout as error:
+        raise HTTPException(504, f"上游合成超时（{upstream_base(cfg)}）: {error}") from error
+    except requests.exceptions.ConnectionError as error:
+        raise HTTPException(503, f"上游 TTS 未运行（{upstream_base(cfg)}）: {error}") from error
+    except Exception as error:  # noqa: BLE001
+        raise HTTPException(502, f"调用上游失败: {error}") from error
 
 
 def resolve_install_file(relative_path: str, *, label: str, extensions: Tuple[str, ...]) -> Path:
@@ -697,26 +721,24 @@ def speech(
     voice = str(payload.get("voice") or cfg["defaults"].get("voice") or "")
     text, upstream_body, fmt = _speech_payload(payload, cfg)
 
-    if not upstream_alive():
-        raise HTTPException(503, f"上游 TTS 未运行（{upstream_base(cfg)}）")
-
     acquired = _SLOTS.acquire(timeout=30)
     if not acquired:
-        raise HTTPException(429, "服务繁忙：并发已满，请稍后重试")
-    try:
-        response = requests.post(
-            f"{upstream_base(cfg)}/tts",
-            json=upstream_body,
-            timeout=float(cfg["upstream"].get("timeout_seconds") or 600),
-        )
-    except Exception as error:  # noqa: BLE001
-        elapsed = int((time.time() - started) * 1000)
         _record({
             "ts": int(time.time()), "client": client.get("name"), "voice": voice,
-            "chars": len(text), "status": 502, "ms": elapsed, "bytes": 0,
-            "error": str(error)[:160],
+            "chars": len(text), "status": 429, "ms": int((time.time() - started) * 1000),
+            "bytes": 0, "error": "concurrency limit",
         })
-        raise HTTPException(502, f"调用上游失败: {error}") from error
+        raise HTTPException(429, "服务繁忙：并发已满，请稍后重试")
+    try:
+        response = _call_upstream(cfg, upstream_body)
+    except HTTPException as error:
+        _record({
+            "ts": int(time.time()), "client": client.get("name"), "voice": voice,
+            "chars": len(text), "status": error.status_code,
+            "ms": int((time.time() - started) * 1000), "bytes": 0,
+            "error": str(error.detail)[:160],
+        })
+        raise
     finally:
         _SLOTS.release()
 
@@ -1143,16 +1165,7 @@ def api_test(request: Request, payload: Dict[str, Any] = Body(...)):
     cfg = load_config()
     started = time.time()
     text, upstream_body, fmt = _speech_payload(payload, cfg)
-    if not upstream_alive():
-        raise HTTPException(503, f"上游 TTS 未运行（{upstream_base(cfg)}）")
-    try:
-        response = requests.post(
-            f"{upstream_base(cfg)}/tts",
-            json=upstream_body,
-            timeout=float(cfg["upstream"].get("timeout_seconds") or 600),
-        )
-    except Exception as error:  # noqa: BLE001
-        raise HTTPException(502, f"调用上游失败: {error}") from error
+    response = _call_upstream(cfg, upstream_body)
     if response.status_code != 200:
         raise HTTPException(502, f"上游返回 {response.status_code}: {response.text[:300]}")
     elapsed = int((time.time() - started) * 1000)
