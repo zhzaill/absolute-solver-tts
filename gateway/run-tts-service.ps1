@@ -1,4 +1,4 @@
-# TTS Service 启动器：带自动重启（退出码 75 = 配置界面请求重启）
+﻿# TTS Service 启动器：带自动重启（退出码 75 = 配置界面请求重启）
 #
 # 服务器上由计划任务 Absolute-Solver-TTS 调用（见 run-tts-service.cmd）。
 # 停止方式：结束计划任务，或在本窗口按 Ctrl+C（不会触发重启）。

@@ -28,7 +28,40 @@ GPT-SoVITS api_v2.py（GPU 合成）
 | `run-tts-service.ps1` / `.cmd` | 启动器：退出码 75 时自动重启（界面「重启服务」用） |
 | `config.json` | 运行配置与密钥（由服务写入，含明文密钥，别提交） |
 
-## 部署（Windows 服务器）
+## 打包与一键部署
+
+仓库带 `deploy/`：
+
+| 文件 | 作用 |
+|---|---|
+| `deploy/package.ps1` | 把服务端源码打成 `dist/tts-service-<版本>-<时间>.zip` |
+| `deploy/install.ps1` | 在目标机安装/升级：备份 → 复制 → 初始化配置 → 防火墙 → 计划任务 → 启动 → 验收 |
+| `deploy/install.cmd` | 双击入口（调用 install.ps1） |
+| `deploy/deploy-remote.ps1` | 在本机一条命令完成"打包 → 上传 → 远程安装 → 回显验收" |
+
+本机一条命令部署到服务器：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File deploy\deploy-remote.ps1 `
+    -Server 192.168.1.166 -Password '***' -HostKey "SHA256:..." `
+    -PublicBaseUrl http://192.168.1.166:18080
+```
+
+目标机上直接安装（解压 zip 后）：
+
+```powershell
+.\install.cmd
+# 或：powershell -ExecutionPolicy Bypass -File deploy\install.ps1 -Port 18080 -DefaultVoice xxx_trained
+```
+
+`install.ps1` 是**幂等**的：重复运行即升级，已存在的管理员口令、客户端密钥、音色表都不会被覆盖；
+每次动手前把 `gateway.py` / `config.json` / 旧启动脚本备份成 `*.pre-install-<时间>.bak`。
+支持 `-DryRun` 预演、`-SkipFirewall` / `-SkipTask` 跳过系统改动。
+
+> 所有 `.ps1` 必须存成 **UTF-8 with BOM**：Windows PowerShell 5.1 会把无 BOM 的 UTF-8 当 ANSI 读，
+> 中文字符串里的引号会被吞掉，脚本直接解析失败（这次踩过）。
+
+## 手动部署（不用安装包）
 
 ```powershell
 # 1. 复制 gateway.py / provision.py / run-tts-service.* / ui\ 到 E:\GPT-SoVITS\gateway\
@@ -36,7 +69,8 @@ GPT-SoVITS api_v2.py（GPU 合成）
 cd E:\GPT-SoVITS\gateway
 & 'E:\GPT-SoVITS\GPT-SoVITS-v2pro-20250604-nvidia50\runtime\python.exe' provision.py `
     --host 0.0.0.0 --port 18080 --public-base-url http://192.168.1.166:18080 `
-    --admin-password '你的管理员口令' --key-name hub --key-note 'Absolute Solver Hub'
+    --admin-password '你的管理员口令' --key-name hub --key-note 'Absolute Solver Hub' `
+    --default-voice xxx_trained
 
 # 3. 放行入站（只需一次）
 New-NetFirewallRule -DisplayName "TTS Service 18080" -Direction Inbound `
@@ -46,7 +80,8 @@ New-NetFirewallRule -DisplayName "TTS Service 18080" -Direction Inbound `
 Start-Process -FilePath "E:\GPT-SoVITS\gateway\run-tts-service.cmd" -WindowStyle Hidden
 ```
 
-`provision.py --list` 可以随时查看当前配置与密钥掩码；`--key-name X` 会再建一把（已存在则不动）。
+`provision.py --list` 可以随时查看当前配置与密钥掩码；`--key-name X` 会再建一把（已存在则不动）；
+`--default-voice X` 切换默认音色。
 
 ## 鉴权
 
@@ -81,14 +116,16 @@ Start-Process -FilePath "E:\GPT-SoVITS\gateway\run-tts-service.cmd" -WindowStyle
 
 | 页面 | 内容 |
 |---|---|
-| 概览 | 请求/字符/字节统计、上游状态、异常提示、最近请求 |
-| 最近请求 | 100 条请求记录（只有长度、状态、耗时，不含文本） |
-| 上游进程 | 状态、启动/停止、日志尾部 |
-| 音色 | 增删改、设默认、参考音频校验、**试听** |
-| 客户端密钥 | 创建（明文只显示一次）、停用、复制、删除 |
-| 服务设置 | 监听/对外地址、上游地址、超时、默认音色与格式、限额 |
+| 概览 | 请求/字符/字节统计、**健康自检**（口令/密钥/音色/安装目录/上游，可选含合成）、异常清单、最近请求 |
+| 最近请求 | 100 条记录（只有长度、状态、耗时，不含文本），按客户端与状态筛选 |
+| 上游进程 | 状态、启停、日志尾部、**权重热加载** |
+| 音色 | 增删改、设默认、参考音频校验、**自动推断语言开关**、**按段语言推断预览**、试听 |
+| 客户端密钥 | 创建（明文只显示一次）、改名/备注、停用、复制、删除 |
+| 服务设置 | 监听/对外地址、上游地址、超时、默认音色与格式、限额；改动未保存时离开会提示 |
 | 安全 | 改管理员口令、查看暴露面 |
 | 接入示例 | 当前对外地址生成的 cURL / Python / Node / 环境变量示例 |
+
+错误会按 HTTP 状态给出可执行的下一步（如 503 → "去启动上游"、413 → "调整上限"），而不是只丢一个原始报文。
 
 改「监听地址、端口、最大并发」需要重启；页面会提示并给出「重启服务」（依赖启动器的退出码 75 循环）。
 

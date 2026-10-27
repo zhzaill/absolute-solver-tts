@@ -1157,6 +1157,89 @@ def api_update_settings(request: Request, payload: Dict[str, Any] = Body(...)):
     return {"ok": True, "restart_required": sorted(set(restart_required))}
 
 
+# ---- 健康自检
+
+@app.post("/admin/api/selfcheck")
+def api_selfcheck(request: Request, payload: Dict[str, Any] = Body(default={})):
+    """给配置界面的「健康自检」用：逐项给出可判断的结论，而不是一个笼统的 200。"""
+    require_admin(request)
+    cfg = load_config()
+    checks: List[Dict[str, Any]] = []
+
+    def add(check_id: str, title: str, ok: bool, detail: str, action: str = "") -> None:
+        checks.append({"id": check_id, "title": title, "ok": ok, "detail": detail, "action": action})
+
+    started = time.time()
+    add(
+        "admin",
+        "管理员口令",
+        bool(cfg["auth"].get("admin_password_hash")),
+        "已设置" if cfg["auth"].get("admin_password_hash") else "未设置，配置界面处于初始化状态",
+        "" if cfg["auth"].get("admin_password_hash") else "#/security",
+    )
+    enabled_keys = [k for k in (cfg.get("keys") or []) if k.get("enabled", True)]
+    add(
+        "keys",
+        "客户端密钥",
+        bool(enabled_keys),
+        f"{len(enabled_keys)} 把启用 / 共 {len(cfg.get('keys') or [])} 把",
+        "" if enabled_keys else "#/keys",
+    )
+    voices = cfg.get("voices") or {}
+    add(
+        "voices",
+        "音色表",
+        bool(voices),
+        f"{len(voices)} 个音色，默认 {cfg['defaults'].get('voice') or '未设置'}",
+        "" if voices else "#/voices",
+    )
+    add(
+        "install",
+        "GPT-SoVITS 安装目录",
+        INSTALL is not None,
+        str(INSTALL) if INSTALL else "未找到，音色编辑与上游启动不可用",
+        "" if INSTALL else "#/settings",
+    )
+
+    probe_started = time.time()
+    alive = upstream_alive(cache_seconds=0)
+    add(
+        "upstream",
+        "上游 TTS",
+        alive,
+        f"{upstream_base(cfg)} · {'在线' if alive else '离线'}（{int((time.time() - probe_started) * 1000)} ms）",
+        "" if alive else "#/upstream",
+    )
+
+    if payload.get("synthesize"):
+        voice = cfg["defaults"].get("voice")
+        if not voices or not voice:
+            add("synthesis", "合成自检", False, "没有可用音色，跳过合成", "#/voices")
+        else:
+            t0 = time.time()
+            try:
+                text, body, _fmt = _speech_payload(
+                    {"input": "自检：图书馆的灯还亮着。", "voice": voice}, cfg
+                )
+                response = _call_upstream(cfg, body)
+                if response.status_code != 200:
+                    add("synthesis", "合成自检", False,
+                        f"上游返回 {response.status_code}: {response.text[:120]}", "#/upstream")
+                else:
+                    add("synthesis", "合成自检", True,
+                        f"{voice} · {len(response.content):,} B · {int((time.time() - t0) * 1000)} ms", "")
+            except HTTPException as error:
+                add("synthesis", "合成自检", False, str(error.detail)[:160], "#/upstream")
+            except Exception as error:  # noqa: BLE001
+                add("synthesis", "合成自检", False, str(error)[:160], "#/upstream")
+
+    return {
+        "ok": all(item["ok"] for item in checks),
+        "elapsed_ms": int((time.time() - started) * 1000),
+        "checks": checks,
+    }
+
+
 # ---- 试听
 
 @app.post("/admin/api/test")

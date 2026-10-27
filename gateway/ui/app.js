@@ -3,7 +3,7 @@
   'use strict';
 
   var $ = function (sel, root) { return (root || document).querySelector(sel); };
-  var state = { overview: null, voices: null, keys: null, route: '' };
+  var state = { overview: null, voices: null, keys: null, route: '', dirty: false, lastHash: '' };
   var timer = null;
   var audioUrl = null;
 
@@ -111,6 +111,44 @@
     }
   }
 
+  // ---------------------------------------------------------------- 错误语义
+
+  function describeError(error) {
+    var status = error && error.status;
+    var detail = (error && (error.detail || error.message)) || '未知错误';
+    var table = {
+      400: { title: '请求不合法', hint: detail, action: '' },
+      401: { title: '凭据无效', hint: '管理会话可能已过期；客户端则是密钥被停用或删除。', action: '#/keys', label: '检查客户端密钥' },
+      403: { title: '被拒绝', hint: '写操作需要会话 Cookie 加 X-TTS-Admin 请求头。', action: '', label: '' },
+      404: { title: '目标不存在', hint: detail, action: '', label: '' },
+      413: { title: '文本过长', hint: '缩短单条文本，或调高「单条最大字符」。', action: '#/settings', label: '调整上限' },
+      429: { title: '服务繁忙', hint: '并发已满，稍后重试；或调高「最大并发」（需重启）。', action: '#/settings', label: '查看并发设置' },
+      502: { title: '上游返回错误', hint: '上游活着但合成失败，看「上游进程」日志尾部。', action: '#/upstream', label: '查看上游日志' },
+      503: { title: '上游未运行', hint: '先把 GPT-SoVITS 上游启动起来。', action: '#/upstream', label: '去启动上游' },
+      504: { title: '上游超时', hint: '合成超过时限；确认 GPU 是否被占满，或调高超时。', action: '#/settings', label: '调整超时' }
+    };
+    var info = table[status] || { title: '操作失败', hint: detail, action: '', label: '' };
+    return {
+      status: status || 0,
+      title: info.title,
+      hint: (status && table[status] ? info.hint + (status >= 400 && detail && detail !== info.hint ? '（' + detail + '）' : '') : info.hint),
+      action: info.action,
+      label: info.label
+    };
+  }
+
+  function errorBanner(error, kind) {
+    var info = describeError(error);
+    var html = '<div class="banner ' + (kind || '') + '">' +
+      '<div class="banner-body"><div class="banner-title">' + esc(info.title) +
+      (info.status ? ' <span class="tag">HTTP ' + esc(info.status) + '</span>' : '') + '</div>' +
+      '<div class="banner-text">' + esc(info.hint) + '</div></div>';
+    if (info.action) {
+      html += '<a class="btn btn-sm" href="' + esc(info.action) + '">' + esc(info.label) + '</a>';
+    }
+    return html + '</div>';
+  }
+
   // ---------------------------------------------------------------- API
 
   async function api(path, options) {
@@ -125,9 +163,8 @@
       init.body = JSON.stringify(options.body);
     }
     var response = await fetch(path, init);
-    if (response.status === 401) {
+    if (response.status === 401 && path.indexOf('/admin/api/') === 0) {
       showGate('login');
-      throw new Error('未登录或会话已过期');
     }
     var type = response.headers.get('content-type') || '';
     var payload = null;
@@ -135,8 +172,10 @@
       payload = await response.json().catch(function () { return null; });
     }
     if (!response.ok) {
-      var detail = payload && payload.detail ? payload.detail : ('HTTP ' + response.status);
-      throw new Error(detail);
+      var error = new Error((payload && payload.detail) || ('HTTP ' + response.status));
+      error.status = response.status;
+      error.detail = payload && payload.detail;
+      throw error;
     }
     return payload;
   }
@@ -155,6 +194,7 @@
     $('#gate-submit').textContent = setup ? '设置并进入' : '进入';
     $('#gate-password').value = '';
     $('#gate-error').textContent = '';
+    document.title = 'TTS Service · 登录';
     setTimeout(function () { $('#gate-password').focus(); }, 40);
   }
 
@@ -244,25 +284,37 @@
   };
 
   var VIEWS = {};
+  var navigatingBack = false;
 
   function route() {
     if ($('#shell').hidden) return;
     var hash = (location.hash || '#/overview').replace(/^#\/?/, '');
     var page = PAGES[hash] ? hash : 'overview';
+    if (state.dirty && !navigatingBack) {
+      if (!window.confirm('服务设置里有未保存的修改，确定离开？')) {
+        navigatingBack = true;
+        location.hash = state.lastHash || '#/overview';
+        return;
+      }
+      state.dirty = false;
+    }
+    navigatingBack = false;
+    state.lastHash = '#/' + page;
     state.route = page;
     $('#brand-page').textContent = PAGES[page];
+    document.title = 'TTS Service · ' + PAGES[page];
     Array.prototype.forEach.call(document.querySelectorAll('.nav-item'), function (item) {
       if (item.getAttribute('data-page') === page) item.setAttribute('aria-current', 'page');
       else item.removeAttribute('aria-current');
     });
     $('#view').innerHTML = '<div class="empty">加载中…</div>';
     (VIEWS[page] || VIEWS.overview)().catch(function (error) {
-      $('#view').innerHTML = '<div class="note bad">加载失败：' + esc(error.message) + '</div>';
+      $('#view').innerHTML = errorBanner(error);
     });
     refreshChrome();
     clearTimeout(timer);
     if (page === 'overview' || page === 'requests' || page === 'upstream') {
-      timer = setTimeout(function () { if (state.route === page) route(); }, 15000);
+      timer = setTimeout(function () { if (state.route === page && !state.dirty) route(); }, 15000);
     }
   }
 
@@ -273,9 +325,14 @@
   function updateChrome(data) {
     var pill = $('#pill-upstream');
     pill.className = 'badge ' + (data.upstream.alive ? 'ok' : 'bad');
+    pill.title = data.upstream.alive ? '上游存活（探针结果，仅供参考）' : '上游离线';
     pill.innerHTML = '<span class="dot"></span><span>上游' + (data.upstream.alive ? '在线' : '离线') + '</span>';
-    $('#pill-listen').textContent = data.listen.host + ':' + data.listen.port;
-    $('#status-left').textContent = 'v' + data.version + ' · ' + data.listen.host + ':' + data.listen.port;
+    var publicHost = String(data.public_base_url || '').replace(/^https?:\/\//, '');
+    var listen = data.listen.host + ':' + data.listen.port;
+    var pill2 = $('#pill-listen');
+    pill2.textContent = publicHost || listen;
+    pill2.title = publicHost ? ('对外地址 ' + data.public_base_url + '（监听 ' + listen + '）') : ('监听 ' + listen);
+    $('#status-left').textContent = 'v' + data.version + ' · ' + (publicHost || listen);
     $('#status-right').textContent = '更新于 ' + new Date().toLocaleTimeString('zh-CN');
   }
 
@@ -287,7 +344,7 @@
   }
 
   function requestTable(rows) {
-    if (!rows || !rows.length) return '<div class="empty">还没有请求</div>';
+    if (!rows || !rows.length) return '<div class="empty">还没有请求。<br><span class="p-text-sm">合成一次之后，这里会出现状态、耗时与字节数（不记录文本）。</span></div>';
     var head = '<tr><th>时间</th><th>客户端</th><th>音色</th><th class="num">字符</th>' +
       '<th class="num">耗时</th><th class="num">字节</th><th>状态</th></tr>';
     var body = rows.map(function (row) {
@@ -301,10 +358,23 @@
         '<td>' + (ok
           ? '<span class="badge ok"><span class="dot"></span>' + esc(row.status) + '</span>'
           : '<span class="badge bad"><span class="dot"></span>' + esc(row.status) + '</span>' +
-            (row.error ? ' <span class="p-text-xs fg-subtle">' + esc(String(row.error).slice(0, 60)) + '</span>' : '')) +
+            (row.error ? ' <span class="p-text-xs fg-subtle" title="' + esc(row.error) + '">' + esc(String(row.error).slice(0, 60)) + '</span>' : '')) +
         '</td></tr>';
     }).join('');
     return '<div class="table-wrap"><table class="table"><thead>' + head + '</thead><tbody>' + body + '</tbody></table></div>';
+  }
+
+  function selfcheckRows(result) {
+    return result.checks.map(function (check) {
+      return '<div class="check-row">' +
+        '<div class="state">' + (check.ok
+          ? '<span class="badge ok"><span class="dot"></span>通过</span>'
+          : '<span class="badge bad"><span class="dot"></span>注意</span>') + '</div>' +
+        '<div class="name">' + esc(check.title) + '</div>' +
+        '<div class="detail">' + esc(check.detail) + '</div>' +
+        (check.action ? '<a class="btn btn-sm" href="' + esc(check.action) + '">处理</a>' : '<span></span>') +
+        '</div>';
+    }).join('');
   }
 
   VIEWS.overview = async function () {
@@ -326,13 +396,21 @@
     html += stat('客户端密钥', counts.keys_enabled + ' / ' + counts.keys, '启用 / 总数');
     html += '</div>';
 
-    html += '<div class="card mt-16"><div class="card-head">服务状态</div><div class="card-body"><dl class="kv">';
+    html += '<div class="card mt-16"><div class="card-head">健康自检<span class="spacer"></span>' +
+      '<label class="switch" title="自检是否顺带合成一句（会占用 GPU 约 2 秒）">' +
+      '<input type="checkbox" id="sc-synth"><span class="switch-track"></span>' +
+      '<span class="p-text-sm fg-muted">含合成</span></label>' +
+      '<button class="btn btn-sm btn-primary" id="sc-run" type="button">运行自检</button></div>' +
+      '<div class="check-list" id="sc-list"><div class="empty">尚未运行。自检会逐项确认口令、密钥、音色、安装目录与上游。</div></div></div>';
+
+    html += '<div class="card"><div class="card-head">服务状态</div><div class="card-body"><dl class="kv">';
     html += '<dt>版本</dt><dd>v' + esc(data.version) + '</dd>';
     html += '<dt>监听</dt><dd>' + esc(data.listen.host + ':' + data.listen.port) + '</dd>';
     html += '<dt>对外地址</dt><dd>' + esc(data.public_base_url) + '</dd>';
     html += '<dt>上游 TTS</dt><dd>' + esc(data.upstream.base) + ' ' +
       (data.upstream.alive ? '<span class="badge ok"><span class="dot"></span>在线</span>'
-        : '<span class="badge bad"><span class="dot"></span>离线</span>') + '</dd>';
+        : '<span class="badge bad"><span class="dot"></span>离线</span>') +
+      ' <span class="hint-inline">（探针仅供参考，合成以实际调用为准）</span></dd>';
     html += '<dt>上游进程</dt><dd>' + (data.upstream.managed
       ? ('由本服务管理，PID ' + esc(data.upstream.pid))
       : '外部启动（不由本服务托管）') + '</dd>';
@@ -340,28 +418,103 @@
     html += '</dl>';
 
     var checks = [];
-    if (!data.checks.has_admin_password) checks.push('未设置管理员口令');
-    if (!data.checks.has_client_key) checks.push('没有启用的客户端密钥，外部客户端无法调用');
-    if (!data.checks.install_found) checks.push('未找到 GPT-SoVITS 安装目录，音色编辑与上游启动不可用');
-    if (!data.upstream.alive) checks.push('上游 TTS 未运行：合成会返回 503');
-    if (checks.length) html += '<div class="note mt-16">需要处理：' + checks.map(esc).join('；') + '</div>';
+    if (!data.checks.has_admin_password) checks.push({ text: '未设置管理员口令', href: '#/security', label: '去设置' });
+    if (!data.checks.has_client_key) checks.push({ text: '没有启用的客户端密钥，外部客户端无法调用', href: '#/keys', label: '去创建' });
+    if (!data.checks.install_found) checks.push({ text: '未找到 GPT-SoVITS 安装目录，音色编辑与上游启动不可用', href: '#/settings', label: '看配置' });
+    if (!data.upstream.alive) checks.push({ text: '上游 TTS 离线（探针），合成会失败', href: '#/upstream', label: '去启动' });
+    if (checks.length) {
+      html += '<div class="banner warn mt-16"><div class="banner-body"><div class="banner-title">需要处理</div>' +
+        '<div class="banner-text">' + checks.map(function (item) { return esc(item.text); }).join('；') + '</div></div>' +
+        '<a class="btn btn-sm" href="' + esc(checks[0].href) + '">' + esc(checks[0].label) + '</a></div>';
+    }
     html += '</div></div>';
 
     html += '<div class="card"><div class="card-head">最近请求<span class="spacer"></span>' +
       '<span class="p-text-xs fg-muted">只记录长度与状态，不记录文本</span></div>' +
       '<div class="card-body tight">' + requestTable(data.recent) + '</div></div>';
     $('#view').innerHTML = html;
+
+    $('#sc-run').addEventListener('click', async function () {
+      var button = $('#sc-run');
+      var list = $('#sc-list');
+      button.disabled = true;
+      list.innerHTML = '<div class="empty">自检中…</div>';
+      try {
+        var result = await api('/admin/api/selfcheck', {
+          method: 'POST',
+          body: { synthesize: $('#sc-synth').checked }
+        });
+        list.innerHTML = selfcheckRows(result);
+        toast(result.ok ? '自检通过（' + result.elapsed_ms + ' ms）' : '自检发现问题，见列表', result.ok ? 'ok' : 'bad');
+      } catch (error) {
+        list.innerHTML = errorBanner(error);
+      } finally {
+        button.disabled = false;
+      }
+    });
   };
 
   VIEWS.requests = async function () {
     var data = await api('/admin/api/requests?limit=100');
-    $('#view').innerHTML = '<div class="card"><div class="card-head">最近请求<span class="spacer"></span>' +
-      '<button class="btn btn-sm" id="refresh-requests" type="button">刷新</button></div>' +
-      '<div class="card-body tight">' + requestTable(data.requests) + '</div></div>';
+    var rows = data.requests || [];
+    var clients = [];
+    rows.forEach(function (row) {
+      if (row.client && clients.indexOf(row.client) < 0) clients.push(row.client);
+    });
+    var html = '<div class="card"><div class="card-head">最近请求<span class="spacer"></span>' +
+      '<span class="p-text-xs fg-muted">共 ' + rows.length + ' 条，最多保留 100 条</span></div>' +
+      '<div class="toolbar">' +
+      '<select class="select" id="f-client"><option value="">全部客户端</option>' +
+      clients.map(function (name) { return '<option value="' + esc(name) + '">' + esc(name) + '</option>'; }).join('') +
+      '</select>' +
+      '<select class="select" id="f-status"><option value="">全部状态</option>' +
+      '<option value="2">成功 (2xx)</option><option value="4">客户端错误 (4xx)</option><option value="5">服务端错误 (5xx)</option>' +
+      '</select>' +
+      '<span class="spacer"></span><button class="btn btn-sm" id="refresh-requests" type="button">刷新</button>' +
+      '</div><div class="card-body tight" id="req-list">' + requestTable(rows) + '</div></div>';
+    $('#view').innerHTML = html;
+
+    var apply = function () {
+      var client = $('#f-client').value;
+      var status = $('#f-status').value;
+      var filtered = rows.filter(function (row) {
+        if (client && row.client !== client) return false;
+        if (status && String(row.status || '')[0] !== status) return false;
+        return true;
+      });
+      $('#req-list').innerHTML = requestTable(filtered);
+    };
+    $('#f-client').addEventListener('change', apply);
+    $('#f-status').addEventListener('change', apply);
     $('#refresh-requests').addEventListener('click', function () { route(); });
   };
 
   // ---------------------------------------------------------------- 音色
+
+  function detectLang(text) {
+    var value = String(text || '');
+    if (/[\u3040-\u309f\u30a0-\u30ff]/.test(value)) return 'ja';
+    if (/[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]/.test(value)) return 'zh';
+    if (/[A-Za-z]/.test(value)) return 'en';
+    return '';
+  }
+
+  function splitSentences(text) {
+    return String(text || '')
+      .split(/(?<=[。！？!?；;\n])/)
+      .map(function (item) { return item.trim(); })
+      .filter(Boolean);
+  }
+
+  function langChips(text) {
+    var pieces = splitSentences(text);
+    if (!pieces.length) return '<span class="hint-inline">输入一段文本，看它会被切成几段、每段推断成什么语言。</span>';
+    return pieces.map(function (piece) {
+      var lang = detectLang(piece) || '（未识别，回落到音色语言）';
+      var cls = (lang === 'ja' || lang === 'zh' || lang === 'en') ? ' ' + lang : '';
+      return '<span class="seg-chip' + cls + '" title="' + esc(piece) + '">' + esc(lang) + '</span>';
+    }).join('');
+  }
 
   VIEWS.voices = async function () {
     var data = await api('/admin/api/voices');
@@ -370,12 +523,14 @@
       var isDefault = data.default === voice.id;
       var weights = [voice.gpt, voice.sovits].filter(Boolean);
       var weightText = weights.length ? weights.map(baseName).join(' / ') : '—';
-      return '<tr>' +
+      return '<tr data-id="' + esc(voice.id) + '">' +
         '<td class="mono nowrap">' + esc(voice.id) + (isDefault ? ' <span class="badge accent">默认</span>' : '') + '</td>' +
         '<td class="mono p-text-xs" title="' + esc(weights.join(' / ')) + '">' + esc(weightText) + '</td>' +
         '<td class="mono p-text-xs">' + esc(voice.ref_audio) + '</td>' +
-        '<td class="nowrap">' + esc(voice.ref_lang) + ' → ' + esc(voice.text_lang) +
-        (voice.auto_text_lang ? ' <span class="badge">自动</span>' : '') + '</td>' +
+        '<td class="nowrap">' + esc(voice.ref_lang) + ' → ' + esc(voice.text_lang) + '</td>' +
+        '<td class="nowrap"><label class="switch" title="按文本自动推断语言；关闭则固定用上面的文本语言">' +
+        '<input type="checkbox" data-act="voice-autolang"' + (voice.auto_text_lang ? ' checked' : '') + '>' +
+        '<span class="switch-track"></span></label></td>' +
         '<td class="num">' + esc(voice.speed) + '</td>' +
         '<td class="nowrap"><div class="row gap-8">' +
         '<button class="btn btn-sm" data-act="voice-try" data-id="' + esc(voice.id) + '" type="button">试听</button>' +
@@ -396,8 +551,8 @@
       '<button class="btn btn-sm btn-primary" id="voice-add" type="button">新增音色</button></div>' +
       '<div class="card-body tight">' +
       (rows ? '<div class="table-wrap"><table class="table"><thead><tr><th>ID</th><th>权重</th><th>参考音频</th>' +
-        '<th>语言</th><th class="num">语速</th><th>操作</th></tr></thead><tbody>' + rows + '</tbody></table></div>'
-        : '<div class="empty">还没有音色。新增时需要一个参考音频与它的原文。</div>') +
+        '<th>语言</th><th>自动推断</th><th class="num">语速</th><th>操作</th></tr></thead><tbody>' + rows + '</tbody></table></div>'
+        : '<div class="empty">还没有音色。<br><span class="p-text-sm">新增时需要一个参考音频与它的原文（逐字一致）；合成时只需给音色 ID。</span></div>') +
       '</div></div>';
     html += '<div class="grid grid-2">' +
       '<div class="card"><div class="card-head">可用 GPT 权重</div><div class="card-body">' + weightList(weights.GPT) + '</div></div>' +
@@ -419,13 +574,28 @@
     html += field('参考音频原文（必须逐字一致）', '<textarea class="textarea" id="v-reftext" rows="3">' + esc(v.ref_text || '') + '</textarea>');
     html += '<div class="form-grid">' +
       field('参考语言', '<input class="input mono" id="v-reflang" value="' + esc(v.ref_lang || 'zh') + '">') +
-      field('文本语言', '<input class="input mono" id="v-textlang" value="' + esc(v.text_lang || 'zh') + '">') +
+      field('文本语言（自动推断关闭时使用）', '<input class="input mono" id="v-textlang" value="' + esc(v.text_lang || 'zh') + '">') +
       field('语速', '<input class="input mono" id="v-speed" type="number" step="0.05" min="0.5" max="2" value="' + esc(v.speed || 1) + '">') +
       '</div>';
     html += '<label class="switch"><input type="checkbox" id="v-autolang"' + (v.auto_text_lang === false ? '' : ' checked') + '>' +
       '<span class="switch-track"></span><span class="p-text-sm">按文本自动推断语言（推荐）</span></label>';
+    html += '<div class="field"><span>推断预览</span>' +
+      '<textarea class="textarea" id="v-preview" rows="2">茶会是淑女的必修课。OK, let me check. それは秘密です。</textarea>' +
+      '<div class="seg-preview" id="v-chips"></div>' +
+      '<span class="field-hint">分段回复时，每段是独立请求，所以按段推断；关闭自动推断则全部用上面的「文本语言」。</span></div>';
 
-    var result = await openModal({ title: voice ? ('编辑音色 ' + voice.id) : '新增音色', html: html, okText: '保存' });
+    var result = await openModal({
+      title: voice ? ('编辑音色 ' + voice.id) : '新增音色',
+      html: html,
+      okText: '保存',
+      setup: function (body) {
+        var preview = body.querySelector('#v-preview');
+        var chips = body.querySelector('#v-chips');
+        var update = function () { chips.innerHTML = langChips(preview.value); };
+        preview.addEventListener('input', update);
+        update();
+      }
+    });
     if (!result.ok) return;
     var body = result.body;
     try {
@@ -445,7 +615,7 @@
       });
       toast('已保存', 'ok');
       route();
-    } catch (error) { toast(error.message, 'bad'); }
+    } catch (error) { toast(describeError(error).title + '：' + describeError(error).hint, 'bad'); }
   }
 
   function tryVoice(voice) {
@@ -474,7 +644,10 @@
             });
             if (!response.ok) {
               var payload = await response.json().catch(function () { return {}; });
-              throw new Error(payload.detail || ('HTTP ' + response.status));
+              var error = new Error(payload.detail || ('HTTP ' + response.status));
+              error.status = response.status;
+              error.detail = payload.detail;
+              throw error;
             }
             var ms = response.headers.get('x-tts-ms');
             var blob = await response.blob();
@@ -485,8 +658,9 @@
             audio.play().catch(function () {});
             meta.textContent = '完成：' + (ms || '?') + ' ms，' + fmtBytes(blob.size);
           } catch (error) {
+            var info = describeError(error);
             meta.textContent = '';
-            toast(error.message, 'bad');
+            toast(info.title + '：' + info.hint, 'bad');
           } finally {
             button.disabled = false;
           }
@@ -509,8 +683,9 @@
         '<td class="num">' + esc(key.uses || 0) + '</td>' +
         '<td class="mono p-text-xs">' + esc(key.last_used_at ? fmtTime(key.last_used_at) : '从未') + '</td>' +
         '<td class="mono p-text-xs">' + esc(fmtTime(key.created_at)) + '</td>' +
-        '<td><div class="row gap-8">' +
+        '<td class="nowrap"><div class="row gap-8">' +
         '<button class="btn btn-sm" data-act="key-copy" type="button">复制</button>' +
+        '<button class="btn btn-sm" data-act="key-edit" type="button">编辑</button>' +
         '<button class="btn btn-sm btn-danger" data-act="key-del" type="button">删除</button>' +
         '</div></td></tr>';
     }).join('');
@@ -520,7 +695,7 @@
       '<div class="card-body tight">' +
       (rows ? '<div class="table-wrap"><table class="table"><thead><tr><th>名称</th><th>密钥</th><th>启用</th>' +
         '<th class="num">调用次数</th><th>最近使用</th><th>创建时间</th><th>操作</th></tr></thead><tbody>' + rows + '</tbody></table></div>'
-        : '<div class="empty">还没有密钥。外部客户端需要一个 sk- 开头的密钥才能调用。</div>') +
+        : '<div class="empty">还没有密钥。<br><span class="p-text-sm">外部客户端需要一把 sk- 开头的密钥才能调用；配置界面本身不消耗配额。</span></div>') +
       '</div></div>' +
       '<div class="note info">密钥明文保存在服务器的 config.json 中，界面上默认只显示前后缀。' +
       '「复制」会重新取回完整密钥；怀疑泄露时删除并新建一把即可。</div>';
@@ -556,7 +731,7 @@
           }
         });
         route();
-      } catch (error) { toast(error.message, 'bad'); }
+      } catch (error) { toast(describeError(error).title + '：' + describeError(error).hint, 'bad'); }
     });
   };
 
@@ -566,6 +741,7 @@
     var data = await api('/admin/api/settings');
     var voiceData = await api('/admin/api/voices');
     state.voices = voiceData;
+    state.dirty = false;
     var voiceOptions = '<option value="">（不设置）</option>' + voiceData.voices.map(function (voice) {
       return '<option value="' + esc(voice.id) + '"' + (data.defaults.voice === voice.id ? ' selected' : '') + '>' +
         esc(voice.id) + '</option>';
@@ -609,6 +785,7 @@
       '</dl></div></div>';
 
     html += '<div class="form-actions"><button class="btn btn-primary" id="s-save" type="button">保存设置</button>' +
+      '<button class="btn" id="s-reset" type="button">放弃修改</button>' +
       '<button class="btn" id="s-restart" type="button">重启服务</button>' +
       '<span id="s-hint" class="p-text-sm fg-muted"></span></div>';
 
@@ -642,6 +819,7 @@
       };
       try {
         var result = await api('/admin/api/settings', { method: 'PUT', body: body });
+        state.dirty = false;
         if (result.restart_required && result.restart_required.length) {
           $('#s-hint').innerHTML = '<span class="attention">已保存；' +
             esc(result.restart_required.join('、')) + ' 需要重启后生效</span>';
@@ -649,7 +827,16 @@
           $('#s-hint').innerHTML = '<span class="success">已保存并立即生效</span>';
         }
         toast('设置已保存', 'ok');
-      } catch (error) { toast(error.message, 'bad'); }
+        refreshChrome();
+      } catch (error) {
+        var info = describeError(error);
+        toast(info.title + '：' + info.hint, 'bad');
+      }
+    });
+
+    $('#s-reset').addEventListener('click', function () {
+      state.dirty = false;
+      route();
     });
 
     $('#s-restart').addEventListener('click', async function () {
@@ -660,7 +847,7 @@
         await api('/admin/api/restart', { method: 'POST' });
         toast('正在重启，稍后刷新页面', 'ok');
         setTimeout(function () { location.reload(); }, 4000);
-      } catch (error) { toast(error.message, 'bad'); }
+      } catch (error) { toast(describeError(error).hint, 'bad'); }
     });
   };
 
@@ -673,7 +860,8 @@
       field('当前口令', '<input class="input" id="p-current" type="password" autocomplete="current-password">') +
       field('新口令', '<input class="input" id="p-new" type="password" autocomplete="new-password">', '至少 8 位') +
       '</div>' +
-      '<div class="form-actions"><button class="btn btn-primary" id="p-save" type="button">修改口令</button></div>' +
+      '<div class="form-actions"><button class="btn btn-primary" id="p-save" type="button">修改口令</button>' +
+      '<span id="p-hint" class="p-text-sm fg-muted"></span></div>' +
       '</div></div>';
 
     html += '<div class="card"><div class="card-head">暴露面</div><div class="card-body"><dl class="kv">' +
@@ -696,7 +884,8 @@
         toast('口令已修改', 'ok');
         $('#p-current').value = '';
         $('#p-new').value = '';
-      } catch (error) { toast(error.message, 'bad'); }
+        $('#p-hint').innerHTML = '<span class="success">下次登录请用新口令</span>';
+      } catch (error) { toast(describeError(error).title + '：' + describeError(error).hint, 'bad'); }
     });
   };
 
@@ -704,6 +893,15 @@
 
   VIEWS.upstream = async function () {
     var data = await api('/admin/api/upstream?tail=80');
+    var voices = null;
+    try { voices = await api('/admin/api/voices'); } catch (error) { /* 音色列表只是锦上添花 */ }
+    var weights = (voices && voices.weights) || { GPT: [], SoVITS: [] };
+    var options = function (items) {
+      return items.map(function (item) {
+        return '<option value="' + esc(item.rel) + '">' + esc(item.rel) + '</option>';
+      }).join('');
+    };
+
     var alive = data.alive;
     var html = '<div class="card"><div class="card-head">上游状态<span class="spacer"></span>' +
       (alive ? '<span class="badge ok"><span class="dot"></span>在线</span>'
@@ -719,8 +917,19 @@
       '<button class="btn btn-danger" id="u-stop" type="button">停止上游</button>' +
       '<button class="btn" id="u-refresh" type="button">刷新</button>' +
       '<span id="u-hint" class="p-text-sm fg-muted"></span></div>' +
-      '</div></div>' +
-      '<div class="card"><div class="card-head">上游日志（末尾 80 行）</div><div class="card-body tight">' +
+      '</div></div>';
+
+    if (weights.GPT.length || weights.SoVITS.length) {
+      html += '<div class="card"><div class="card-head">热加载权重<span class="spacer"></span>' +
+        '<span class="p-text-sm card-sub">只切换上游当前权重，不改音色表</span></div><div class="card-body">' +
+        '<div class="form-grid">' +
+        field('GPT 权重', '<select class="select" id="w-gpt"><option value="">（不改）</option>' + options(weights.GPT) + '</select>') +
+        field('SoVITS 权重', '<select class="select" id="w-sovits"><option value="">（不改）</option>' + options(weights.SoVITS) + '</select>') +
+        '</div><div class="form-actions"><button class="btn" id="w-load" type="button">加载到上游</button>' +
+        '<span id="w-hint" class="p-text-sm fg-muted"></span></div></div></div>';
+    }
+
+    html += '<div class="card"><div class="card-head">上游日志（末尾 80 行）</div><div class="card-body tight">' +
       '<pre class="log">' + esc((data.log_tail || []).join('\n') || '（没有日志）') + '</pre></div></div>';
     $('#view').innerHTML = html;
 
@@ -734,21 +943,45 @@
         $('#u-hint').textContent = result.ready ? '上游已就绪' : (result.note || '仍在启动');
       } catch (error) {
         $('#u-hint').textContent = '';
-        toast(error.message, 'bad');
+        toast(describeError(error).title + '：' + describeError(error).hint, 'bad');
       } finally {
         button.disabled = false;
         route();
       }
     });
     $('#u-stop').addEventListener('click', async function () {
-      var ok = await confirmDialog('停止上游', '<p>停止后合成会返回 503。</p>', '停止');
+      var ok = await confirmDialog('停止上游', '<p>停止后合成会失败（503）。</p>', '停止');
       if (!ok) return;
       try {
         await api('/admin/api/upstream/stop', { method: 'POST' });
         toast('已停止', 'ok');
         route();
-      } catch (error) { toast(error.message, 'bad'); }
+      } catch (error) { toast(describeError(error).hint, 'bad'); }
     });
+    if ($('#w-load')) {
+      $('#w-load').addEventListener('click', async function () {
+        var body = {};
+        if ($('#w-gpt').value) body.gpt = $('#w-gpt').value;
+        if ($('#w-sovits').value) body.sovits = $('#w-sovits').value;
+        if (!body.gpt && !body.sovits) {
+          $('#w-hint').textContent = '至少选择一项';
+          return;
+        }
+        var button = $('#w-load');
+        button.disabled = true;
+        $('#w-hint').textContent = '加载中…';
+        try {
+          var result = await api('/admin/api/upstream/load', { method: 'POST', body: body });
+          $('#w-hint').innerHTML = '<span class="success">已加载：' +
+            Object.keys(result.results || {}).join(' / ') + '</span>';
+        } catch (error) {
+          $('#w-hint').textContent = '';
+          toast(describeError(error).hint, 'bad');
+        } finally {
+          button.disabled = false;
+        }
+      });
+    }
   };
 
   // ---------------------------------------------------------------- 示例
@@ -756,7 +989,7 @@
   VIEWS.guide = async function () {
     var overview = await api('/admin/api/overview');
     var base = overview.public_base_url;
-    var voice = overview.defaults.voice || 'furina_normal';
+    var voice = overview.defaults.voice || 'xxx_trained';
     var sample = '茶会是淑女的必修课。';
 
     var curl = [
@@ -814,7 +1047,8 @@
       'DSH_TTS_API_KEY=sk-你的密钥'
     ].join('\n');
 
-    var html = '<div class="note info">对外地址取自「服务设置」里的配置；换网段后改一次，示例会自动更新。</div>' +
+    var html = '<div class="note info">对外地址取自「服务设置」里的配置；换网段后改一次，示例会自动更新。' +
+      '本服务返回到达的音频是<b>完整 WAV</b>，不提供流式 PCM。</div>' +
       '<div class="card mt-16"><div class="card-head">cURL</div><div class="card-body"><pre class="code">' + esc(curl) + '</pre></div></div>' +
       '<div class="card"><div class="card-head">Python（openai SDK）</div><div class="card-body"><pre class="code">' + esc(python) + '</pre></div></div>' +
       '<div class="card"><div class="card-head">Node.js</div><div class="card-body"><pre class="code">' + esc(node) + '</pre></div></div>' +
@@ -823,6 +1057,60 @@
   };
 
   // ---------------------------------------------------------------- 事件委托
+
+  document.addEventListener('input', function (event) {
+    if (state.route === 'settings' && event.target.closest && event.target.closest('#view')) {
+      state.dirty = true;
+    }
+  });
+
+  document.addEventListener('change', async function (event) {
+    var target = event.target;
+    if (!target || !target.closest) return;
+
+    if (state.route === 'settings' && target.closest('#view')) state.dirty = true;
+
+    var auto = target.closest('input[data-act="voice-autolang"]');
+    if (auto) {
+      var row = auto.closest('tr');
+      var vid = row.getAttribute('data-id');
+      var list = (state.voices && state.voices.voices) || [];
+      var voice = list.filter(function (item) { return item.id === vid; })[0];
+      if (!voice) return;
+      try {
+        await api('/admin/api/voices', {
+          method: 'POST',
+          body: {
+            id: voice.id, gpt: voice.gpt || '', sovits: voice.sovits || '',
+            ref_audio: voice.ref_audio, ref_text: voice.ref_text,
+            ref_lang: voice.ref_lang, text_lang: voice.text_lang,
+            speed: voice.speed, auto_text_lang: auto.checked
+          }
+        });
+        toast(auto.checked ? '已开启自动推断' : '已固定为 ' + voice.text_lang, 'ok');
+        route();
+      } catch (error) {
+        auto.checked = !auto.checked;
+        toast(describeError(error).hint, 'bad');
+      }
+      return;
+    }
+
+    var toggle = target.closest('input[data-act="key-toggle"]');
+    if (toggle) {
+      var keyRow = toggle.closest('tr');
+      try {
+        await api('/admin/api/keys/' + encodeURIComponent(keyRow.getAttribute('data-id')), {
+          method: 'PUT',
+          body: { enabled: toggle.checked }
+        });
+        toast(toggle.checked ? '已启用' : '已停用', 'ok');
+      } catch (error) {
+        toggle.checked = !toggle.checked;
+        toast(describeError(error).hint, 'bad');
+      }
+    }
+  });
 
   document.addEventListener('click', async function (event) {
     var button = event.target.closest ? event.target.closest('button[data-act]') : null;
@@ -857,6 +1145,25 @@
         await copyText(revealed.key);
         toast('密钥已复制到剪贴板', 'ok');
       }
+      if (act === 'key-edit' && kid) {
+        var record = ((state.keys && state.keys.keys) || []).filter(function (item) { return item.id === kid; })[0] || {};
+        var result = await openModal({
+          title: '编辑密钥',
+          html: field('用途名称', '<input class="input" id="k-name" value="' + esc(record.name || '') + '">') +
+            field('备注', '<input class="input" id="k-note" value="' + esc(record.note || '') + '">'),
+          okText: '保存'
+        });
+        if (!result.ok) return;
+        await api('/admin/api/keys/' + encodeURIComponent(kid), {
+          method: 'PUT',
+          body: {
+            name: result.body.querySelector('#k-name').value.trim(),
+            note: result.body.querySelector('#k-note').value.trim()
+          }
+        });
+        toast('已保存', 'ok');
+        route();
+      }
       if (act === 'key-del' && kid) {
         var okDelete = await confirmDialog('删除密钥',
           '<p>删除后使用这把密钥的客户端会立刻收到 401。</p>', '删除');
@@ -866,24 +1173,7 @@
         route();
       }
     } catch (error) {
-      toast(error.message, 'bad');
-    }
-  });
-
-  document.addEventListener('change', async function (event) {
-    var input = event.target.closest ? event.target.closest('input[data-act="key-toggle"]') : null;
-    if (!input) return;
-    var row = input.closest('tr');
-    if (!row) return;
-    try {
-      await api('/admin/api/keys/' + encodeURIComponent(row.getAttribute('data-id')), {
-        method: 'PUT',
-        body: { enabled: input.checked }
-      });
-      toast(input.checked ? '已启用' : '已停用', 'ok');
-    } catch (error) {
-      input.checked = !input.checked;
-      toast(error.message, 'bad');
+      toast(describeError(error).title + '：' + describeError(error).hint, 'bad');
     }
   });
 

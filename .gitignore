@@ -51,3 +51,9 @@ _out_test/
 Thumbs.db
 .idea/
 .vscode/
+
+# Deployment artifacts and local deploy secrets
+dist/
+deploy/.staging/
+deploy/.deploy-key.txt
+gateway/config.json

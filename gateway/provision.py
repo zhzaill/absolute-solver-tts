@@ -32,11 +32,22 @@ def main() -> int:
     parser.add_argument("--reset-admin", action="store_true")
     parser.add_argument("--key-name", default=None)
     parser.add_argument("--key-note", default="")
+    parser.add_argument("--default-voice", default=None, help="把某个已注册音色设为默认")
     parser.add_argument("--list", action="store_true")
     args = parser.parse_args()
 
     cfg = svc.bootstrap_config()
     changed = False
+
+    if args.default_voice:
+        if args.default_voice not in (cfg.get("voices") or {}):
+            print(f"音色不存在，未设置默认: {args.default_voice}")
+        elif cfg["defaults"].get("voice") != args.default_voice:
+            cfg["defaults"]["voice"] = args.default_voice
+            print(f"默认音色已设为 {args.default_voice}")
+            changed = True
+        else:
+            print(f"默认音色已是 {args.default_voice}")
 
     if args.host:
         cfg["server"]["host"] = args.host
