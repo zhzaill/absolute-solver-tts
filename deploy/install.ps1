@@ -1,4 +1,4 @@
-﻿# TTS Service 一键安装 / 升级（在目标服务器上运行）
+# TTS Service 一键安装 / 升级（在目标服务器上运行）
 #
 #   powershell -ExecutionPolicy Bypass -File install.ps1
 #   powershell -ExecutionPolicy Bypass -File install.ps1 -Port 18080 -KeyName hub
@@ -47,7 +47,7 @@ foreach ($candidate in $candidates) {
 if (-not $Source) { Fail "找不到 gateway.py；请在解压后的安装包目录里运行 install.ps1" }
 Say "源目录   : $Source"
 
-$required = @("gateway.py", "provision.py", "run-tts-service.cmd", "run-tts-service.ps1", "ui\index.html", "ui\app.css", "ui\app.js")
+$required = @("gateway.py", "stream_pipeline.py", "provision.py", "run-tts-service.cmd", "run-tts-service.ps1", "ui\index.html", "ui\app.css", "ui\app.js")
 foreach ($relative in $required) {
     if (-not (Test-Path (Join-Path $Source $relative))) { Fail "安装包不完整，缺少 $relative" }
 }
@@ -104,13 +104,14 @@ foreach ($name in @("gateway.py", "config.json", "run-absolute-solver-gateway.cm
 
 if (-not $DryRun) {
     Copy-Item (Join-Path $Source "gateway.py") $InstallDir -Force
+    Copy-Item (Join-Path $Source "stream_pipeline.py") $InstallDir -Force
     Copy-Item (Join-Path $Source "provision.py") $InstallDir -Force
     Copy-Item (Join-Path $Source "run-tts-service.cmd") $InstallDir -Force
     Copy-Item (Join-Path $Source "run-tts-service.ps1") $InstallDir -Force
     $uiTarget = Join-Path $InstallDir "ui"
     New-Item -ItemType Directory -Path $uiTarget -Force | Out-Null
     Copy-Item (Join-Path $Source "ui\*") $uiTarget -Force
-    Say "     已复制 gateway.py / provision.py / run-tts-service.* / ui\"
+    Say "     已复制 gateway.py / stream_pipeline.py / provision.py / run-tts-service.* / ui\"
 }
 
 # ---------------------------------------------------------------- 初始化配置

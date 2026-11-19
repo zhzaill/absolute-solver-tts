@@ -17,9 +17,10 @@
   * 客户端鉴权：`Authorization: Bearer sk-...` 或 `x-api-key`，多把密钥、可停用、可轮换。
   * 管理鉴权：独立管理员口令，HttpOnly 会话 Cookie；不与客户端密钥共用。
   * 监听地址来自 config.json（默认 0.0.0.0:18080），因此必须存在管理员口令与至少一把客户端密钥。
-  * **不做伪流式**：上游分段响应在本服务被完整收齐后再返回。`/v1/audio/speech` 返回的是
-    完整音频，与 OpenAI 的语义一致。Provider 侧流式 PCM 属于独立任务，见
-    `D:\\11\\Logs\\2026-10-27-tts-streaming-pcm-可行性判定.md`。
+  * **两条交付路径并存**：`/v1/audio/speech` 仍是整段 WAV（OpenAI 语义，兼容 Coo 的
+    market 插件与 DSH 插件）；`/v1/audio/segments` 是句子级流式交付（见
+    `stream_pipeline.py`）：首句先合成、前导静音裁掉、按序逐段送出。网关不伪造分块，
+    上游流式返回时才逐段转发。
   * 参考音频只需注册一次（`/v1/audio/voices`），之后客户端只传 text；语言由文本推断，
     可用 `text_lang` 显式覆盖。
 
@@ -36,14 +37,17 @@ from __future__ import annotations
 import collections
 import hashlib
 import hmac
+import io
 import json
 import os
 import re
 import secrets
 import shutil
 import subprocess
+import sys
 import threading
 import time
+import wave
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -51,9 +55,20 @@ import requests
 import uvicorn
 from fastapi import Body, FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Response
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Response, StreamingResponse
 
-VERSION = "2.0.0"
+# 服务器上的 runtime 是嵌入式发行版，sys.path 里只有 python39.zip，
+# 脚本所在目录不会自动进 path —— 所以这里显式补一次。
+_HERE = Path(__file__).resolve().parent
+if str(_HERE) not in sys.path:
+    sys.path.insert(0, str(_HERE))
+
+try:  # 安装目录是平铺的：同目录下的 stream_pipeline.py
+    import stream_pipeline
+except ImportError:  # 仓库里是包：gateway.stream_pipeline
+    from gateway import stream_pipeline  # type: ignore[no-redef]
+
+VERSION = "3.0.0"
 SERVICE_NAME = "tts-service"
 ADMIN_COOKIE = "tts_admin"
 
@@ -73,7 +88,7 @@ EXIT_RESTART = 75
 DEFAULT_CONFIG: Dict[str, Any] = {
     "version": 2,
     "server": {
-        "host": "0.0.0.0",
+        "host": "127.0.0.1",
         "port": 18080,
         # 写进调用示例里给客户端用的地址；留空则由监听地址推断
         "public_base_url": "",
@@ -708,6 +723,30 @@ MIME = {
 }
 
 
+def _upstream_audio(response: requests.Response, fmt: str) -> bytes:
+    if response.status_code != 200:
+        raise HTTPException(502, f"上游返回 {response.status_code}: {response.text[:300]}")
+    audio = response.content
+    if not audio:
+        raise HTTPException(502, "上游返回了空音频")
+    if fmt != "wav":
+        return audio
+    try:
+        with wave.open(io.BytesIO(audio), "rb") as wav:
+            width = wav.getsampwidth()
+            expected = wav.getnframes() * wav.getnchannels() * width
+            pcm = wav.readframes(wav.getnframes())
+            if not expected or len(pcm) != expected:
+                raise ValueError("missing or truncated PCM")
+    except (EOFError, ValueError, wave.Error) as error:
+        raise HTTPException(502, "上游返回了无效或不完整的 WAV") from error
+    silence = 128 if width == 1 else 0
+    if pcm.count(silence) == len(pcm):
+        # GPT-SoVITS can return an HTTP 200 with a silent WAV on inference failure.
+        raise HTTPException(502, "上游返回了全静音 WAV，请检查推理日志和显存")
+    return audio
+
+
 @app.post("/v1/audio/speech")
 def speech(
     payload: Dict[str, Any] = Body(...),
@@ -730,7 +769,7 @@ def speech(
         })
         raise HTTPException(429, "服务繁忙：并发已满，请稍后重试")
     try:
-        response = _call_upstream(cfg, upstream_body)
+        audio = _upstream_audio(_call_upstream(cfg, upstream_body), fmt)
     except HTTPException as error:
         _record({
             "ts": int(time.time()), "client": client.get("name"), "voice": voice,
@@ -743,15 +782,6 @@ def speech(
         _SLOTS.release()
 
     elapsed = int((time.time() - started) * 1000)
-    if response.status_code != 200:
-        _record({
-            "ts": int(time.time()), "client": client.get("name"), "voice": voice,
-            "chars": len(text), "status": response.status_code, "ms": elapsed,
-            "bytes": 0, "error": response.text[:160],
-        })
-        raise HTTPException(502, f"上游返回 {response.status_code}: {response.text[:300]}")
-
-    audio = response.content
     _record({
         "ts": int(time.time()), "client": client.get("name"), "voice": voice,
         "chars": len(text), "status": 200, "ms": elapsed, "bytes": len(audio), "error": None,
@@ -765,6 +795,174 @@ def speech(
             "x-tts-voice": voice,
             "x-tts-chars": str(len(text)),
             "cache-control": "no-store",
+        },
+    )
+
+
+# ---------------------------------------------------------------- 句子级流式
+
+SEGMENT_MIME = "application/x-tts-segments"
+
+
+def _assert_not_silent(audio: bytes) -> None:
+    """上游推理失败会给 HTTP 200 + 全静音 WAV，这种"成功"必须当失败。
+
+    注意不能用 `wave` 模块：上游流式模式的 WAV 头把 data 长度写成 0，`wave` 会读出 0 帧。
+    """
+    try:
+        _rate, _channels, width, pcm = stream_pipeline.split_wav(audio)
+    except ValueError as error:
+        raise HTTPException(502, f"上游返回了无效的 WAV: {error}") from error
+    if not pcm:
+        raise HTTPException(502, "上游返回了空 PCM")
+    floor = 128 if width == 1 else 0
+    if pcm.count(floor) == len(pcm):
+        raise HTTPException(502, "上游返回了全静音 WAV，请检查推理日志和显存")
+
+
+def _upstream_stream_call(cfg: Dict[str, Any]) -> stream_pipeline.UpstreamCall:
+    """把一次上游流式请求包成 ``stream_pipeline`` 需要的 callable。
+
+    一次只发一段，收齐这段的字节后交给裁剪；`first_byte_ms` 记的是真的字节到达时刻，
+    不是请求发出的时刻。
+    """
+
+    default_timeout = float(cfg["upstream"].get("timeout_seconds") or 600)
+    url = f"{upstream_base(cfg)}/tts"
+
+    def call(body: Dict[str, Any], call_timeout: float) -> Tuple[bytes, int]:
+        timeout = float(call_timeout or default_timeout)
+        started = time.perf_counter()
+        try:
+            response = requests.post(url, json=body, stream=True, timeout=timeout)
+        except requests.exceptions.Timeout as error:
+            raise HTTPException(504, f"上游合成超时: {error}") from error
+        except requests.exceptions.ConnectionError as error:
+            raise HTTPException(503, f"上游 TTS 未运行: {error}") from error
+        except Exception as error:  # noqa: BLE001
+            raise HTTPException(502, f"调用上游失败: {error}") from error
+        try:
+            if response.status_code != 200:
+                raise HTTPException(502, f"上游返回 {response.status_code}: {response.text[:300]}")
+            first_byte_ms = 0
+            chunks: List[bytes] = []
+            for chunk in response.iter_content(16384):
+                if not chunk:
+                    continue
+                if not first_byte_ms:
+                    first_byte_ms = int((time.perf_counter() - started) * 1000)
+                chunks.append(chunk)
+            audio = b"".join(chunks)
+            if not audio:
+                raise HTTPException(502, "上游返回了空音频")
+            _assert_not_silent(audio)
+            return audio, first_byte_ms or int((time.perf_counter() - started) * 1000)
+        finally:
+            response.close()
+
+    return call
+
+
+@app.post("/v1/audio/segments")
+def segments(
+    payload: Dict[str, Any] = Body(...),
+    authorization: Optional[str] = Header(default=None),
+    x_api_key: Optional[str] = Header(default=None),
+):
+    """句子级流式合成：首句先合成，按句逐段交付。
+
+    响应是「4 字节小端长度 + 1 字节类型 + 载荷」的帧流：类型 0 是 JSON 元数据
+    （plan / segment / done），类型 1 是该段完整的 WAV。客户端收到第一段就能开口。
+    """
+    started = time.time()
+    client = require_client(authorization, x_api_key)
+    cfg = load_config()
+    voice = str(payload.get("voice") or cfg["defaults"].get("voice") or "")
+    text, base_body, fmt = _speech_payload(payload, cfg)
+    if fmt != "wav":
+        raise HTTPException(400, "分段接口只输出 wav")
+    base_body["media_type"] = "wav"
+
+    units = stream_pipeline.split_units(
+        text,
+        first_early_cut=int(payload.get("first_early_cut", stream_pipeline.FIRST_SENTENCE_EARLY_CUT_CHARS) or 0),
+        max_chars=int(payload.get("unit_max_chars", stream_pipeline.UNIT_MAX_CHARS) or 0) or stream_pipeline.UNIT_MAX_CHARS,
+    )
+    if not units:
+        raise HTTPException(400, "input 里没有可合成的内容")
+
+    first_tier = stream_pipeline.Tier(
+        sample_steps=max(1, int(payload.get("first_steps", stream_pipeline.FIRST_TIER.sample_steps))),
+        speed=float(payload.get("first_speed", stream_pipeline.FIRST_TIER.speed)),
+        streaming_mode=int(payload.get("first_streaming_mode", stream_pipeline.FIRST_TIER.streaming_mode)),
+    )
+    later_tier = stream_pipeline.Tier(
+        sample_steps=max(1, int(payload.get("later_steps", stream_pipeline.LATER_TIER.sample_steps))),
+        speed=float(payload.get("speed") or stream_pipeline.LATER_TIER.speed),
+        streaming_mode=int(payload.get("later_streaming_mode", stream_pipeline.LATER_TIER.streaming_mode)),
+    )
+
+    def body_for(unit: stream_pipeline.Unit, tier: stream_pipeline.Tier) -> Dict[str, Any]:
+        body = dict(base_body)
+        body.update({
+            "text": unit.text,
+            "streaming_mode": tier.streaming_mode,
+            "sample_steps": tier.sample_steps,
+            "speed_factor": tier.speed,
+            "text_split_method": "cut0",  # 句子已经在网关切好，引擎不要再切
+            "fragment_interval": 0.05,
+        })
+        return body
+
+    call = _upstream_stream_call(cfg)
+
+    if not _SLOTS.acquire(timeout=30):
+        _record({
+            "ts": int(time.time()), "client": client.get("name"), "voice": voice,
+            "chars": len(text), "status": 429, "ms": int((time.time() - started) * 1000),
+            "bytes": 0, "error": "concurrency limit", "mode": "segments",
+        })
+        raise HTTPException(429, "服务繁忙：并发已满，请稍后重试")
+
+    stats = {"segments": 0, "failed": 0, "bytes": 0, "first_segment_ms": 0}
+
+    def generate():
+        try:
+            for frame in stream_pipeline.iter_frames(
+                text, body_for, call, first_tier=first_tier, later_tier=later_tier, units=units
+            ):
+                kind = frame[4] if len(frame) > 4 else None
+                if kind == 1 and not stats["first_segment_ms"]:
+                    stats["first_segment_ms"] = int((time.perf_counter() - started) * 1000)
+                elif kind == 0 and b'"segment"' in frame[:96]:
+                    stats["segments"] += 1
+                    if b'"failed"' in frame[:4096]:
+                        stats["failed"] += 1
+                if len(frame) > 5 and frame[4] == 1:
+                    stats["bytes"] += len(frame) - 5
+                yield frame
+        finally:
+            _SLOTS.release()
+            elapsed = int((time.time() - started) * 1000)
+            _record({
+                "ts": int(time.time()), "client": client.get("name"), "voice": voice,
+                "chars": len(text), "status": 200 if not stats["failed"] else 502,
+                "ms": elapsed, "bytes": stats["bytes"],
+                "error": None if not stats["failed"] else f"{stats['failed']} 段失败",
+                "mode": "segments", "segments": stats["segments"],
+                "first_segment_ms": stats["first_segment_ms"],
+            })
+
+    return StreamingResponse(
+        generate(),
+        media_type=SEGMENT_MIME,
+        headers={
+            "x-request-id": secrets.token_hex(6),
+            "x-tts-engine": "pipeline",
+            "x-tts-units": str(len(units)),
+            "x-tts-voice": voice,
+            "cache-control": "no-store",
+            "x-accel-buffering": "no",
         },
     )
 
@@ -1221,13 +1419,9 @@ def api_selfcheck(request: Request, payload: Dict[str, Any] = Body(default={})):
                 text, body, _fmt = _speech_payload(
                     {"input": "自检：图书馆的灯还亮着。", "voice": voice}, cfg
                 )
-                response = _call_upstream(cfg, body)
-                if response.status_code != 200:
-                    add("synthesis", "合成自检", False,
-                        f"上游返回 {response.status_code}: {response.text[:120]}", "#/upstream")
-                else:
-                    add("synthesis", "合成自检", True,
-                        f"{voice} · {len(response.content):,} B · {int((time.time() - t0) * 1000)} ms", "")
+                audio = _upstream_audio(_call_upstream(cfg, body), _fmt)
+                add("synthesis", "合成自检", True,
+                    f"{voice} · {len(audio):,} B · {int((time.time() - t0) * 1000)} ms", "")
             except HTTPException as error:
                 add("synthesis", "合成自检", False, str(error.detail)[:160], "#/upstream")
             except Exception as error:  # noqa: BLE001
@@ -1248,12 +1442,10 @@ def api_test(request: Request, payload: Dict[str, Any] = Body(...)):
     cfg = load_config()
     started = time.time()
     text, upstream_body, fmt = _speech_payload(payload, cfg)
-    response = _call_upstream(cfg, upstream_body)
-    if response.status_code != 200:
-        raise HTTPException(502, f"上游返回 {response.status_code}: {response.text[:300]}")
+    audio = _upstream_audio(_call_upstream(cfg, upstream_body), fmt)
     elapsed = int((time.time() - started) * 1000)
     return Response(
-        content=response.content,
+        content=audio,
         media_type=MIME.get(fmt, "audio/wav"),
         headers={"x-tts-ms": str(elapsed), "cache-control": "no-store"},
     )
@@ -1433,8 +1625,8 @@ def main() -> None:
     _reset_slots()
     threading.Thread(target=_flush_loop, daemon=True).start()
 
-    host = str(cfg["server"].get("host") or "0.0.0.0")
-    port = int(cfg["server"].get("port") or 18080)
+    host = str(os.environ.get("TTS_BIND_HOST") or cfg["server"].get("host") or "127.0.0.1")
+    port = int(os.environ.get("TTS_BIND_PORT") or cfg["server"].get("port") or 18080)
 
     print("=" * 68)
     print(f" TTS Service v{VERSION}")
