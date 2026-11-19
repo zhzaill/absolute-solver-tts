@@ -99,7 +99,14 @@ export class TtsStreamWorld {
     this.cfg = opts.cfg ?? { ...DEFAULTS };
     this.dataDir = opts.dataDir ?? process.cwd();
     this.secret = typeof opts.secret === 'function' ? opts.secret : () => '';
+    // 测试用：给了 onPlay 就不去起 PowerShell，直接把落盘路径交出去
+    this.onPlay = typeof opts.onPlay === 'function' ? opts.onPlay : null;
     this.language = 'zh';
+  }
+
+  /** 上一轮的摘要（状态工具与测试用）。 */
+  get lastTurn() {
+    return this.#lastTurn;
   }
 
   // ---------------------------------------------------------------- 配置
@@ -193,6 +200,10 @@ export class TtsStreamWorld {
     writeFileSync(path, wav);
     this.#segments.push({ path, at: Date.now() });
     this.#pruneSegments();
+    if (this.onPlay) {
+      this.onPlay(path, wav);
+      return;
+    }
     if (!this.#bool('play')) return;
     const player = this.#ensurePlayer();
     const id = String(++this.#playerSeq);
