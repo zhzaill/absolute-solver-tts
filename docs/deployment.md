@@ -27,19 +27,7 @@ The directory must contain `api_v2.py` and `webui.py`.
 .\scripts\setup-gateway.ps1
 ```
 
-### 3. Set a key
-
-Generate a long random token and keep it outside Git:
-
-```powershell
-$env:GATEWAY_API_KEY = "<long-random-token>"
-```
-
-The gateway binds `127.0.0.1` by default. No key is required for loopback-only
-development, but a key is recommended even then so the DSH configuration is
-representative of production.
-
-### 4. Start GPT-SoVITS upstream
+### 3. Start GPT-SoVITS upstream
 
 Start the installed `api_v2.py` on port `9880` using its normal launch procedure.
 Then start the gateway:
@@ -54,7 +42,12 @@ Verify:
 Invoke-RestMethod http://127.0.0.1:18080/healthz
 ```
 
-### 5. Register a voice
+### 4. Set up authentication and register a voice
+
+Open `/admin` from the gateway machine, initialize the administrator password,
+and create a client key for `/v1` calls. Client calls require a key on loopback too.
+Register the voice in the same panel or obtain a session token from
+`POST /admin/api/login` and set it in `TTS_ADMIN_TOKEN` for the script below.
 
 ```powershell
 Copy-Item .\config\voices.example.json .\config\voices.local.json
@@ -62,7 +55,7 @@ notepad .\config\voices.local.json
 .\scripts\check-assets.ps1 -Manifest .\config\voices.local.json
 .\scripts\register-voices.ps1 `
   -Manifest .\config\voices.local.json `
-  -ApiKey $env:GATEWAY_API_KEY
+  -AdminToken $env:TTS_ADMIN_TOKEN
 ```
 
 `ref_text` must be the exact words spoken in `ref_audio`. A structurally valid
@@ -115,14 +108,12 @@ select the voice preset.
 | Variable | Default | Meaning |
 |---|---|---|
 | `GPTSOVITS_HOME` | none | GPT-SoVITS install root |
-| `GATEWAY_HOST` | `127.0.0.1` | Bind address |
-| `GATEWAY_PORT` | `18080` | Gateway port |
-| `GPTSOVITS_API_PORT` | `9880` | Upstream API port |
-| `GATEWAY_API_KEY` | empty | Optional bearer/API key |
-| `GATEWAY_STATE_FILE` | `gateway/gateway_state.json` | Runtime voice registry |
-| `GATEWAY_CORS_ORIGINS` | `*` | Comma-separated browser origins |
+| `TTS_CONFIG` | `gateway/config.json` | Runtime config, admin state, client keys and voices |
+| `TTS_BIND_HOST` | `server.host` from config | Override the gateway bind address for this process |
+| `TTS_BIND_PORT` | `server.port` from config | Override the gateway bind port for this process |
+| `TTS_ADMIN_PASSWORD` | empty | Initialize the admin password if unset |
 
-Binding to a non-loopback address without a key is rejected.
+The default upstream is `http://127.0.0.1:9880`; change it in `/admin` or `upstream.base` in the config file. Binding to a non-loopback address requires an initialized admin password and at least one enabled client key.
 
 ## Plugin configuration
 

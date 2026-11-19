@@ -17,13 +17,13 @@ Content-Type: application/json
   "first_early_cut": 11, "unit_max_chars": 120 }
 ```
 
-响应：`Content-Type: application/x-tts-segments`，`Transfer-Encoding: chunked`。
+响应：`Content-Type: application/x-tts-segments`。HTTP/1.1 可使用 `Transfer-Encoding: chunked`；HTTP 传输块边界与下述协议帧边界无关。
 
 首部行：`x-tts-engine: pipeline`、`x-tts-units: <段数>`、`x-tts-voice`、`x-request-id`。
 
 ## 帧
 
-每帧 = `4 字节小端长度` + `1 字节类型` + `载荷`。
+每帧 = `4 字节小端无符号长度` + `1 字节类型` + `载荷`。长度只计载荷字节，不含长度字段与类型字节。
 
 | 类型 | 载荷 | 说明 |
 | --- | --- | --- |
@@ -47,11 +47,11 @@ Content-Type: application/json
 | `text` | 本段文本 |
 | `chars` | 字数 |
 | `status` | `ok` / `failed` |
-| `lead_ms` | 裁掉的前导静音毫秒（首声证据就靠它） |
+| `lead_ms` | 裁掉的前导静音毫秒；不代表请求到首声的延迟 |
 | `audio_seconds` | 本段时长 |
 | `rate` | 采样率 |
 | `upstream_ms` / `first_byte_ms` | 上游耗时 / 首字节耗时 |
-| `rtf` | `upstream_ms / audio_seconds` |
+| `rtf` | `(upstream_ms / 1000) / audio_seconds`，无量纲；音频时长为零时为 `null` |
 | `error` | 失败原因（`status=failed` 时） |
 
 `status=failed` 时**仍然跟一帧音频**（40 ms 静音）。这是活性约定：客户端可以按序号接续，不会因为缺一段而永久停住。
@@ -77,7 +77,7 @@ Content-Type: application/json
 ## 演进
 
 - 加字段：只加不改，客户端忽略未知字段即可。
-- 改字段语义：换 `kind` 名或加 `v` 字段，老客户端会忽略。
+- 保留现有 `kind` 的字段语义。可并存的新语义用新 `kind`；仅在已知 `kind` 上加 `v` 字段，旧客户端仍会按原语义解析。
 - 需要别的形态（SSE、multipart、整段 WAV）时，在**同一条管线**外面套适配层，不复制切句与裁剪逻辑。整段 WAV 已经就是这样一个适配层：`/v1/audio/speech`。
 
 ## 不该放进协议的

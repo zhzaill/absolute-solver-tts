@@ -24,10 +24,14 @@ jobs:
       - name: Python tests
         run: python -m unittest discover -s tests -v
 
+      - name: Coo world and segment protocol tests
+        run: node --test coo/cortico-world-tts-stream/test/*.test.mjs
+
       - name: JavaScript syntax
         shell: bash
         run: |
           find plugin -name '*.mjs' -type f -print0 | xargs -0 -n1 node --check
+          find coo -type f \( -name '*.js' -o -name '*.mjs' \) -print0 | xargs -0 -n1 node --check
 
       - name: Plugin schema checks
         run: node plugin/tools/verify-schemas.mjs

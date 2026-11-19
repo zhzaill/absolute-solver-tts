@@ -53,6 +53,9 @@ DSH 推荐把网关放在模型服务器上，通过 SSH 将远端 `127.0.0.1:18
 ## 已实现
 
 - OpenAI 兼容接口：`POST /v1/audio/speech`
+- **句子级流式接口：`POST /v1/audio/segments`**（v3 主路径，见下节）
+- **Cortico/Coo World：`coo/cortico-world-tts-stream`**，气泡进来就按句合成并按段播放
+- **MicroDuck 播放：主机端适配 `scripts/duck_relay.py` + 板端 `scripts/duck_player.py`**
 - 音色注册：模型权重、参考音频、参考原文、参考语言、默认合成语言
 - 文本语言优先级：请求显式声明 -> 字形推断 -> 音色默认值
 - 中文、日文、英文的显式语言声明
@@ -81,12 +84,41 @@ DSH 推荐把网关放在模型服务器上，通过 SSH 将远端 `127.0.0.1:18
 ```text
 plugin/                 DSH bundle（零运行时依赖）
 browser/                根级 DSH 工具视图 bundle（无工具、无权限）
-gateway/                FastAPI OpenAI 兼容网关
+gateway/                FastAPI 网关（整段 WAV + 句子级流式）
+coo/                    Cortico/Coo World 与探针（分段合成、本机播放、鸭身转发）
 config/                 音色与插件配置模板
-scripts/                安装、隧道、注册、校验和测试脚本
-docs/                   架构、部署、故障排查、历史结论、许可
-tests/                  网关离线测试
+scripts/                安装、隧道、注册、校验、测试与鸭身两端脚本
+docs/                   架构、部署、协议、故障排查、历史结论、许可
+tests/                  网关、管道、协议与鸭身适配测试
 ```
+
+## 句子级流式（v3）
+
+整段 WAV 的问题是「多久开口」：一条 40 字的气泡整段合成要 2–4 秒（P104 / v2Pro 实测 RTF 0.36–0.55），这段时间里什么都听不到。v3 把交付改成按句：
+
+```text
+一条气泡文本
+  → 网关切句（强句末必切；首句 ≤11 字早切；避开数字与文件名）
+  → 第 1 句：4 步 CFM、语速 1.067、上游流式档位 3
+  → 第 2..n 句：16 步、语速 0.97、档位 2
+  → 每段裁掉模型生成的前导静音（10 ms 窗 / -45 dBFS + 50 ms 预滚），段首尾淡化
+  → 「4 字节长度 + 1 字节类型」帧流逐段交付：类型 0 是元数据，类型 1 是该段完整 WAV
+```
+
+客户端收到第一段就开口；后面的句子在播放第一段时继续合成。协议细节见
+[分段语音协议 v1](docs/segment-protocol.md)，时序与参数见
+[流式架构](docs/streaming-architecture.md)，实测见
+[2026-11-19 测量](docs/measurements-2026-11-19.md)。
+
+Coo 侧用 `coo/cortico-world-tts-stream`（协议客户端 + SoundPlayer 串行播放 + 可选鸭身转发）。
+`/v1/audio/speech` 仍然存在，是同一管线的整段适配，供 OpenAI 兼容客户端使用。
+
+### 鸭身（MicroDuck）
+
+主机与板端只通过一条已认证的 SSH 会话传音频与回执：stdin 是 `uint32_le(n) + 完整 WAV`，
+stdout 是每段一行 JSON（`seq`、`bytes`、`sha256`、`alsa_exit_code`）。
+`scripts/duck_player.py` 是板端（可由主机 base64 送入 `python3` 直接执行，板上免安装），
+`scripts/duck_relay.py` 是主机端。真机验收见 [验收手册](docs/microduck-acceptance.md)。
 
 ## 快速开始
 
@@ -99,17 +131,15 @@ git clone https://github.com/<your-account>/absolute-solver-tts.git
 Set-Location absolute-solver-tts
 
 $env:GPTSOVITS_HOME = "D:\GPT-SoVITS"
-$env:GATEWAY_API_KEY = "<generate-a-long-random-token>"
 
 .\scripts\setup-gateway.ps1
 .\scripts\start-gateway.ps1
 ```
 
-网关默认绑定 `127.0.0.1:18080`。如果确实要直接监听局域网，需显式设置：
+网关默认绑定 `127.0.0.1:18080`。打开 `http://127.0.0.1:18080/admin`，先初始化管理员口令，再创建一把客户端密钥。`GATEWAY_API_KEY` 可在调用端保存该密钥，不用于配置网关。若确实需要监听局域网，先在回环地址完成初始化，再运行：
 
 ```powershell
-$env:GATEWAY_HOST = "0.0.0.0"
-$env:GATEWAY_API_KEY = "<required-for-non-loopback>"
+.\scripts\start-gateway.ps1 -BindHost 0.0.0.0
 ```
 
 ### 2. 注册自己的音色
@@ -120,10 +150,12 @@ $env:GATEWAY_API_KEY = "<required-for-non-loopback>"
 Copy-Item .\config\voices.example.json .\config\voices.local.json
 notepad .\config\voices.local.json
 .\scripts\check-assets.ps1 -Manifest .\config\voices.local.json
-.\scripts\register-voices.ps1 -Manifest .\config\voices.local.json
+.\scripts\register-voices.ps1 -Manifest .\config\voices.local.json -AdminToken $env:TTS_ADMIN_TOKEN
 ```
 
-`voices.local.json` 已被 `.gitignore` 排除。不要把真实音色资产放进仓库。
+`TTS_ADMIN_TOKEN` 是 `/admin/api/login` 返回的短期管理员会话令牌。也可以直接在 `/admin` 的音色页面登记。`voices.local.json` 已被 `.gitignore` 排除。不要把真实音色资产放进仓库。
+
+部署角色、CPU/GPU 档位及接口边界见 [本地 GPT TTS v1 定义](docs/local-gpt-tts.md)。将 Cortico 的 WAV 交给 MicroDuck 真机播放，见 [MicroDuck 验收手册](docs/microduck-acceptance.md)。
 
 ### 3. 安装 DSH 插件
 
