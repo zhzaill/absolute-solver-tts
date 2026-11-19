@@ -1,5 +1,10 @@
 # Architecture
 
+> **2026-11-19 更新**：主交付路径已改为句子级流式（`/v1/audio/segments` + Coo 的
+> `cortico-world-tts-stream`）。本文描述的是仍然成立的**分层与接口契约**；
+> 流式那一路的时序、参数与实测见 [streaming-architecture.md](streaming-architecture.md)。
+> 整段 WAV（`/v1/audio/speech`）保留为兼容壳。
+
 ## Goals
 
 The system separates four concerns that are often conflated:
@@ -41,16 +46,16 @@ The gateway exposes:
 | `GET` | `/` | Service summary |
 | `GET` | `/v1/models` | OpenAI-compatible model list |
 | `GET` | `/v1/audio/voices` | Registered voices |
-| `POST` | `/v1/audio/voices` | Create or replace a voice |
-| `POST` | `/v1/audio/voices/default` | Set the default voice |
-| `DELETE` | `/v1/audio/voices/{id}` | Remove a voice |
+| `POST` | `/admin/api/voices` | Create or replace a voice |
+| `POST` | `/admin/api/voices/default` | Set the default voice |
+| `DELETE` | `/admin/api/voices/{id}` | Remove a voice |
 | `POST` | `/v1/audio/speech` | Synthesize speech |
-| `GET` | `/admin/upstream/status` | Upstream process status |
-| `POST` | `/admin/upstream/start` | Start upstream when configured |
-| `POST` | `/admin/upstream/stop` | Stop the managed upstream |
-| `POST` | `/admin/upstream/load` | Load GPT/SoVITS weights |
+| `GET` | `/admin/api/upstream` | Upstream process status |
+| `POST` | `/admin/api/upstream/start` | Start upstream when configured |
+| `POST` | `/admin/api/upstream/stop` | Stop the managed upstream |
+| `POST` | `/admin/api/upstream/load` | Load GPT/SoVITS weights |
 
-When `GATEWAY_API_KEY` is set, non-health endpoints require:
+The client endpoints under `/v1` require a gateway-issued key:
 
 ```http
 Authorization: Bearer <key>
@@ -61,6 +66,8 @@ or:
 ```http
 X-API-Key: <key>
 ```
+
+Administration uses a separate session. Scripts can send the short-lived token from `/admin/api/login` in `X-Admin-Token`.
 
 ### DSH plugin
 

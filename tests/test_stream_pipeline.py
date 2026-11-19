@@ -38,9 +38,15 @@ class SplitUnitsTest(unittest.TestCase):
         self.assertTrue(units[0].first)
         self.assertFalse(units[1].first)
 
-    def test_weak_ending_cuts_first_sentence(self):
+    def test_short_first_clause_merges_into_first_unit(self):
+        # 「嗯，」太短，盖不住第二段的合成时间，所以并进首段
         units = sp.split_units("嗯，这件事让我想想再说。")
-        self.assertEqual(units[0].text, "嗯，")
+        self.assertEqual(units[0].text, "嗯，这件事让我想想再说。")
+
+    def test_first_clause_cuts_once_long_enough(self):
+        units = sp.split_units("先说一句，然后我们再继续往下说别的。")
+        self.assertEqual(units[0].text, "先说一句，")
+        self.assertGreaterEqual(units[1].chars, 1)
 
     def test_weak_ending_needs_length_after_first(self):
         units = sp.split_units("这是第一句。嗯，后面还有内容要继续说完。")

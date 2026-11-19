@@ -1,0 +1,21 @@
+{
+  "name": "cortico-world-tts-stream",
+  "version": "0.1.0",
+  "description": "Cortico/Coo world: sentence-level streaming speech. Listens to the pet's own bubble lines, asks the gateway for segmented audio, and plays each segment the moment it arrives.",
+  "license": "MIT",
+  "type": "module",
+  "main": "./src/index.js",
+  "exports": { ".": "./src/index.js" },
+  "files": ["src"],
+  "engines": { "node": ">=22" },
+  "keywords": ["cortico-world", "cortico", "coo", "tts", "streaming"],
+  "scripts": {
+    "test": "node --test test/*.test.mjs"
+  },
+  "cortico": {
+    "kind": "world",
+    "api": 6,
+    "displayName": "流式语音（分段）",
+    "tags": ["voice", "tts", "streaming"]
+  }
+}

@@ -42,6 +42,12 @@ FIRST_SENTENCE_EARLY_CUT_CHARS = 11
 WEAK_ENDING_MIN_CHARS = 5
 """非首句在弱停顿处切，本行至少要这么长。"""
 
+FIRST_WEAK_MIN_CHARS = 5
+"""首句在弱停顿处切也要够长：太短的首段盖不住第二段的合成时间，会听到空档。"""
+
+EARLY_CUT_LOOKAHEAD = 6
+"""早切之前先看这么多个字符：有标点就等一等，别把一句话从中间劈开。"""
+
 UNIT_MAX_CHARS = 120
 """单个合成单元的字数上限；超了先找弱停顿，找不到就硬切。"""
 
@@ -152,7 +158,8 @@ def split_units(
         elif ch == DOT:
             boundary = _is_dot_boundary(body, i - 1)
         elif ch in WEAK_ENDINGS:
-            boundary = (not first_done) or visible >= WEAK_ENDING_MIN_CHARS
+            floor = FIRST_WEAK_MIN_CHARS if not first_done else WEAK_ENDING_MIN_CHARS
+            boundary = visible >= floor
 
         if boundary:
             # 收尾符号与后续空白跟着本句
@@ -164,17 +171,20 @@ def split_units(
             continue
 
         if not first_done and first_early_cut and visible >= first_early_cut:
-            at = _safe_cut(body, i)
-            head = body[:at].strip()
-            tail = body[at:]
-            buf.clear()
-            if head:
-                pieces.append(head)
-            first_done = True
-            body = tail
-            size = len(body)
-            i = 0
-            continue
+            # 后面几步之内就有句末/停顿的话，等一下切更整的句子，别在句子中间下刀
+            lookahead = "".join(body[i:i + EARLY_CUT_LOOKAHEAD])
+            if not any(mark in lookahead for mark in STRONG_ENDINGS + WEAK_ENDINGS):
+                at = _safe_cut(body, i)
+                head = body[:at].strip()
+                tail = body[at:]
+                buf.clear()
+                if head:
+                    pieces.append(head)
+                first_done = True
+                body = tail
+                size = len(body)
+                i = 0
+                continue
 
     flush()
 
