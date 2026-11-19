@@ -56,6 +56,11 @@ export const DEFAULTS = {
   duckTarget: '',
   duckDevice: '',
   duckRelay: '',
+  duckHostKey: '',
+  duckPassword: '',
+  duckPlink: '',
+  // 板上的 aplay 不做软件音量，缩放放在板端播放器里；0.5 是「听得到但不吵」
+  duckGain: 0.5,
 };
 
 const msg = (err) => (err instanceof Error ? err.message : String(err));
@@ -251,6 +256,13 @@ export class TtsStreamWorld {
     else args.push('--local');
     const device = this.#str('duckDevice');
     if (device) args.push('--device', device);
+    const hostKey = this.#str('duckHostKey');
+    if (hostKey) args.push('--host-key', hostKey);
+    const password = this.#str('duckPassword');
+    if (password) args.push('--password', password);
+    if (target && this.#str('duckPlink')) args.push('--plink', this.#str('duckPlink'));
+    const gain = this.#num('duckGain', 0, 1);
+    if (gain < 0.999) args.push('--gain', String(gain));
     const python = this.#str('duckPython') || 'python';
     const child = spawn(python, ['-u', ...args], { stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true });
     let buffer = '';
@@ -487,6 +499,15 @@ export class TtsStreamWorld {
     const scanMs = this.#num('scanMs', 50, 5000);
     this.#timer = setInterval(() => { void this.#scan(); }, scanMs);
     this.#timer.unref?.();
+    // 预热：SSH 会话与板端播放器的启动（约 2 秒）挪到 World 启动时，
+    // 别让第一条气泡替它买单。
+    if (this.#bool('duckEnabled')) {
+      try {
+        this.#ensureDuck();
+      } catch (err) {
+        this.#duckState = `预热失败：${msg(err)}`;
+      }
+    }
     host?.log?.info?.('流式语音已就绪', {
       gateway: this.#str('baseUrl'),
       voice: this.#str('voice') || '(default)',
@@ -557,6 +578,10 @@ export function configGroup() {
         [`${K}.duckDevice`]: str('ALSA 设备', '如 plughw:CARD=Speak,DEV=0；留空用默认设备'),
         [`${K}.duckPython`]: str('Python', '跑主机端适配的解释器，默认 python'),
         [`${K}.duckRelay`]: str('适配脚本', '留空用仓库里的 scripts/duck_relay.py'),
+        [`${K}.duckPlink`]: str('plink 路径', 'Windows 上走 plink 时填完整路径；留空用 ssh'),
+        [`${K}.duckHostKey`]: str('主机指纹', 'plink 的 -hostkey，如 SHA256:...'),
+        [`${K}.duckPassword`]: str('SSH 密码', 'plink 的 -pw；明文存在 Coo 的 config.json 里，能换密钥就换密钥'),
+        [`${K}.duckGain`]: { type: 'number', title: '鸭声音量', description: '0–1，板端软件缩放（板上 aplay 没有音量参数）', minimum: 0, maximum: 1, 'x-hot': true },
         [`${K}.keep`]: num('保留段数', '超出后删最旧的', 1, 5000),
         [`${K}.timeoutMs`]: num('超时', '单次合成的上限（毫秒）', 5000, 900000, { 'x-suffix': 'ms' }),
       },

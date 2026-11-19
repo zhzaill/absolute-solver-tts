@@ -185,5 +185,36 @@ class DuckProtocolTest(unittest.TestCase):
         self.assertEqual(summary["sent"], 0)
 
 
+class GainTest(unittest.TestCase):
+    """板端软件音量：aplay 没有音量参数，只能缩放 PCM。"""
+
+    def setUp(self) -> None:
+        import sys as _sys
+
+        _sys.path.insert(0, str(ROOT / "scripts"))
+        import duck_player  # noqa: F401  (导入即注册模块，测试里直接用)
+
+        self.player = duck_player
+
+    def peak(self, data: bytes) -> int:
+        rate, channels, width, pcm = self.player.split_pcm(data)
+        values = struct.unpack("<%dh" % (len(pcm) // 2), pcm[: len(pcm) // 2 * 2])
+        return max(abs(v) for v in values)
+
+    def test_gain_halves_amplitude_and_keeps_duration(self):
+        wav = tone_wav(0.05)
+        scaled = self.player.scale_wav(wav, 0.5)
+        rate_a, _c, _w, pcm_a = self.player.split_pcm(wav)
+        rate_b, _c2, _w2, pcm_b = self.player.split_pcm(scaled)
+        self.assertEqual(rate_a, rate_b)
+        self.assertEqual(len(pcm_a), len(pcm_b))
+        self.assertLess(self.peak(scaled), self.peak(wav) * 0.6)
+        self.assertGreater(self.peak(scaled), self.peak(wav) * 0.4)
+
+    def test_gain_one_is_a_noop(self):
+        wav = tone_wav(0.05)
+        self.assertEqual(self.player.scale_wav(wav, 1.0), wav)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import io
 import json
 import os
 import shlex
@@ -24,14 +25,25 @@ import struct
 import subprocess
 import sys
 import time
+import wave
+from array import array
 
 MAX_FRAME = 8 * 1024 * 1024
 MIN_FRAME = 1
 
+PLAYER_COMMAND: list[str] = []
 
-def emit(receipt: dict) -> None:
-    sys.stdout.write(json.dumps(receipt, ensure_ascii=False) + "\n")
+
+def emit(receipt: dict, log_path: str = "") -> None:
+    line = json.dumps(receipt, ensure_ascii=False)
+    sys.stdout.write(line + "\n")
     sys.stdout.flush()
+    if log_path:
+        try:
+            with open(log_path, "a", encoding="utf-8") as handle:
+                handle.write(time.strftime("%Y-%m-%dT%H:%M:%S") + " " + line + "\n")
+        except OSError as error:
+            sys.stderr.write(f"cannot write {log_path}: {error}\n")
 
 
 def read_exact(stream, count: int) -> bytes | None:
@@ -111,37 +123,89 @@ def play(wav: bytes, command: list[str]) -> tuple[int | None, str]:
     return 0, ""
 
 
-def serve(stream, command: list[str]) -> int:
+def scale_wav(data: bytes, gain: float) -> bytes:
+    """按增益缩放 16 位 PCM，返回新的 WAV。board 上的 aplay 不做软件音量，只能自己缩。"""
+    if gain >= 0.999:
+        return data
+    rate, channels, width, pcm = split_pcm(data)
+    if width != 2:
+        return data
+    usable = len(pcm) - (len(pcm) % 2)
+    samples = array("h")
+    samples.frombytes(pcm[:usable])
+    for index, value in enumerate(samples):
+        samples[index] = int(value * gain)
+    output = io.BytesIO()
+    with wave.open(output, "wb") as writer:
+        writer.setnchannels(channels)
+        writer.setsampwidth(width)
+        writer.setframerate(rate)
+        writer.writeframes(samples.tobytes())
+    return output.getvalue()
+
+
+def split_pcm(data: bytes) -> tuple[int, int, int, bytes]:
+    """拆出 (采样率, 声道, 位宽, PCM)，不信任头里声明的长度。"""
+    if len(data) < 12 or data[0:4] != b"RIFF" or data[8:12] != b"WAVE":
+        raise ValueError("不是 RIFF/WAVE 音频")
+    _ok, _reason, rate, channels, width = validate_wav(data)
+    offset = 12
+    size = len(data)
+    pcm = b""
+    while offset + 8 <= size:
+        chunk_id = data[offset:offset + 4]
+        chunk_size = struct.unpack("<I", data[offset + 4:offset + 8])[0]
+        body = offset + 8
+        end = min(size, body + chunk_size) if chunk_size else size
+        if chunk_id == b"data":
+            pcm = data[body:end] if chunk_size else data[body:]
+            break
+        offset = end if chunk_size else size
+    return rate, channels, width, pcm
+
+
+def serve(stream, command: list[str], log_path: str = "", gain: float = 1.0) -> int:
     seq = 0
+    session_start = time.time()
     while True:
         header = stream.read(4)
         if not header:
             return 0  # 段边界上的 EOF：正常结束
         if len(header) < 4:
             emit({"seq": seq, "ok": False, "bytes": 0, "sha256": "", "alsa_exit_code": None,
-                  "error": "头部被截断（半帧结束）"})
+                  "error": "头部被截断（半帧结束）"}, log_path)
             return 2
         size = int.from_bytes(header, "little")
         if size < MIN_FRAME or size > MAX_FRAME:
             emit({"seq": seq, "ok": False, "bytes": size, "sha256": "", "alsa_exit_code": None,
-                  "error": f"帧长度越界：{size}（允许 1–{MAX_FRAME}）"})
+                  "error": f"帧长度越界：{size}（允许 1–{MAX_FRAME}）"}, log_path)
             return 2
         wav = read_exact(stream, size)
         if wav is None:
             emit({"seq": seq, "ok": False, "bytes": 0, "sha256": "", "alsa_exit_code": None,
-                  "error": "载荷被截断（半帧结束）"})
+                  "error": "载荷被截断（半帧结束）"}, log_path)
             return 2
 
         digest = hashlib.sha256(wav).hexdigest()
         ok, reason, rate, channels, width = validate_wav(wav)
         if not ok:
             emit({"seq": seq, "ok": False, "bytes": len(wav), "sha256": digest,
-                  "alsa_exit_code": None, "error": reason})
+                  "alsa_exit_code": None, "error": reason}, log_path)
             seq += 1
             continue
 
         started = time.time()
-        code, error = play(wav, command)
+        payload = wav
+        if gain < 0.999:
+            try:
+                payload = scale_wav(wav, gain)
+            except (ValueError, wave.Error) as error:
+                emit({"seq": seq, "ok": False, "bytes": len(wav), "sha256": digest,
+                      "alsa_exit_code": None, "error": f"缩放失败：{error}"}, log_path)
+                seq += 1
+                continue
+        # 回执里的 sha256 始终是「收到的那份」——主机就是拿它核对发送记录的
+        code, error = play(payload, command)
         receipt = {
             "seq": seq,
             "ok": code == 0,
@@ -150,11 +214,15 @@ def serve(stream, command: list[str]) -> int:
             "alsa_exit_code": code,
             "rate": rate,
             "channels": channels,
+            "player": " ".join(PLAYER_COMMAND),
+            "gain": round(gain, 2),
+            # 从本次会话开始到这一段交给 aplay 的毫秒数：鸭身首声就从这里算
+            "t_start_ms": int((started - session_start) * 1000),
             "ms": int((time.time() - started) * 1000),
         }
         if error:
             receipt["error"] = error
-        emit(receipt)
+        emit(receipt, log_path)
         seq += 1
 
 
@@ -173,13 +241,17 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="MicroDuck 板端分段播放器")
     parser.add_argument("--aplay", default="aplay -q", help="播放器命令（默认 aplay -q）")
     parser.add_argument("--device", default="", help="ALSA 设备，如 plughw:CARD=Speak,DEV=0")
+    parser.add_argument("--log", default="", help="把每段回执也追加写进这个文件，便于事后取证")
+    parser.add_argument("--gain", type=float, default=1.0, help="软件音量 0–1；板上的 aplay 不做音量")
     args = parser.parse_args(argv)
 
     command = split_command(args.aplay)
     if args.device:
         command += ["-D", args.device]
     command.append("-")
-    return serve(sys.stdin.buffer, command)
+    PLAYER_COMMAND[:] = command
+    gain = min(1.0, max(0.0, float(args.gain)))
+    return serve(sys.stdin.buffer, command, args.log, gain)
 
 
 if __name__ == "__main__":

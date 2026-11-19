@@ -33,11 +33,17 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 PLAYER = os.path.join(HERE, "duck_player.py")
 
 BOOTSTRAP = (
-    "import sys,base64;"
+    "import sys,base64,json;"
     "n=int(sys.stdin.buffer.readline());"
     "src=base64.b64decode(sys.stdin.buffer.read(n));"
+    "sys.argv=['duck_player.py']+json.loads('''%s''');"
     "exec(compile(src,'duck_player.py','exec'),{'__name__':'__main__'})"
 )
+"""板端引导：先读一段 base64 的播放器源码，再把它当 __main__ 跑起来。
+
+命令行参数（设备、日志路径）以 JSON 数组嵌进引导里——`python3 -c` 的位置参数
+到不了被 exec 的脚本，只能这样传。
+"""
 
 
 def log(message: str) -> None:
@@ -61,7 +67,13 @@ def build_command(args) -> list[str]:
         command = ["ssh", "-o", "BatchMode=yes"]
     if args.identity:
         command += ["-i", args.identity]
-    command += [args.target, f"python3 -u -c {shlex.quote(BOOTSTRAP)}"]
+    extra = ["--log", args.remote_log] if args.remote_log else []
+    if args.device:
+        extra += ["--device", args.device]
+    if args.gain < 0.999:
+        extra += ["--gain", f"{args.gain:g}"]
+    bootstrap = BOOTSTRAP % json.dumps(extra) if extra else BOOTSTRAP % "[]"
+    command += [args.target, f"python3 -u -c {shlex.quote(bootstrap)}"]
     return command
 
 
@@ -101,6 +113,9 @@ def main(argv=None) -> int:
     parser.add_argument("--identity", default="", help="SSH 私钥")
     parser.add_argument("--max-pending", type=int, default=3, help="最多几段未回执")
     parser.add_argument("--receipt-timeout", type=float, default=30.0, help="等回执的秒数")
+    parser.add_argument("--remote-log", default="/tmp/duck_player.log",
+                        help="板端把每段回执追加写到这个文件；留空则不写")
+    parser.add_argument("--gain", type=float, default=1.0, help="板端软件音量 0–1")
     args = parser.parse_args(argv)
 
     if not args.local and not args.target:
