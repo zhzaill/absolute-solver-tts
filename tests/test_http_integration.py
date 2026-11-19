@@ -17,13 +17,13 @@ from pathlib import Path
 import requests
 
 
-def silent_wav() -> bytes:
+def fixture_wav() -> bytes:
     buffer = io.BytesIO()
     with wave.open(buffer, "wb") as output:
         output.setnchannels(1)
         output.setsampwidth(2)
         output.setframerate(16000)
-        output.writeframes(b"\x00\x00" * 1600)
+        output.writeframes(b"\x20\x00\xe0\xff" * 800)
     return buffer.getvalue()
 
 
@@ -49,7 +49,7 @@ class FakeUpstreamHandler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(b"missing text_lang")
             return
-        audio = silent_wav()
+        audio = fixture_wav()
         self.send_response(200)
         self.send_header("Content-Type", "audio/wav")
         self.send_header("Content-Length", str(len(audio)))
@@ -79,23 +79,22 @@ class GatewayHttpIntegrationTest(unittest.TestCase):
         (cls.install / "webui.py").write_text("# fixture\n", encoding="utf-8")
         (cls.install / "GPT_weights" / "voice.ckpt").write_bytes(b"fixture")
         (cls.install / "SoVITS_weights" / "voice.pth").write_bytes(b"fixture")
-        (cls.install / "outputs" / "reference.wav").write_bytes(silent_wav())
+        (cls.install / "outputs" / "reference.wav").write_bytes(fixture_wav())
 
         cls.upstream = ThreadingHTTPServer(("127.0.0.1", 0), FakeUpstreamHandler)
         cls.upstream_thread = threading.Thread(target=cls.upstream.serve_forever, daemon=True)
         cls.upstream_thread.start()
 
         cls.port = free_port()
-        cls.auth_key = "integration" + "-auth"
+        config_path = cls.root / "gateway-config.json"
+        config_path.write_text(json.dumps({
+            "upstream": {"base": f"http://127.0.0.1:{cls.upstream.server_port}"},
+        }), encoding="utf-8")
         env = os.environ.copy()
         env.update(
             {
                 "GPTSOVITS_HOME": str(cls.install),
-                "GPTSOVITS_API_PORT": str(cls.upstream.server_port),
-                "GATEWAY_HOST": "127.0.0.1",
-                "GATEWAY_PORT": str(cls.port),
-                "GATEWAY_API_KEY": cls.auth_key,
-                "GATEWAY_STATE_FILE": str(cls.root / "gateway_state.json"),
+                "TTS_CONFIG": str(config_path),
             }
         )
         repo_root = Path(__file__).resolve().parents[1]
@@ -150,18 +149,24 @@ class GatewayHttpIntegrationTest(unittest.TestCase):
         cls.upstream_thread.join(timeout=5)
         cls.temp.cleanup()
 
-    def headers(self) -> dict[str, str]:
-        return {"Authorization": f"Bearer {self.auth_key}"}
-
     def test_end_to_end_http_contract(self) -> None:
         base = f"http://127.0.0.1:{self.port}"
+
+        # TestClient can supply a session directly. The real HTTP smoke must
+        # exercise initial setup and client key creation across the network.
+        setup = requests.post(f"{base}/admin/api/setup", json={"password": "test-admin-only"}, timeout=10)
+        self.assertEqual(setup.status_code, 200, setup.text)
+        admin_headers = {"X-Admin-Token": setup.json()["token"]}
+        key = requests.post(f"{base}/admin/api/keys", headers=admin_headers, json={"name": "smoke"}, timeout=5)
+        self.assertEqual(key.status_code, 200, key.text)
+        client_headers = {"Authorization": f"Bearer {key.json()['key']}"}
 
         unauthenticated = requests.get(f"{base}/v1/audio/voices", timeout=5)
         self.assertEqual(unauthenticated.status_code, 401)
 
         registration = requests.post(
-            f"{base}/v1/audio/voices",
-            headers=self.headers(),
+            f"{base}/admin/api/voices",
+            headers=admin_headers,
             json={
                 "id": "local_voice",
                 "gpt": "GPT_weights/voice.ckpt",
@@ -177,7 +182,7 @@ class GatewayHttpIntegrationTest(unittest.TestCase):
 
         synthesis = requests.post(
             f"{base}/v1/audio/speech",
-            headers=self.headers(),
+            headers=client_headers,
             json={
                 "model": "tts-1",
                 "voice": "local_voice",

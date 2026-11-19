@@ -1,4 +1,4 @@
-/**
+﻿/**
  * World 集成测试：假事件库 + 假网关，验证「气泡 → 分段合成 → 落盘 → 交播放器」整条自身逻辑。
  *
  * 不碰真 Coo、不碰真网关、不播放：播放器被替换成记录器。
@@ -9,7 +9,7 @@
  */
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
-import { mkdtempSync, readdirSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
@@ -73,6 +73,18 @@ function startGateway() {
   });
 }
 
+function cleanup(dir) {
+  // 子进程刚被杀掉时文件可能还占着，Windows 上会 EPERM
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    try {
+      rmSync(dir, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+      return;
+    } catch {
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 100);
+    }
+  }
+}
+
 function fakeHost(events) {
   return {
     store: {
@@ -114,7 +126,58 @@ test('气泡事件被切成两段、按序落盘并按序排队播放', async ()
   } finally {
     await world.stop();
     await gateway.close();
-    rmSync(dir, { recursive: true, force: true });
+    cleanup(dir);
+  }
+});
+
+test('开着鸭身时，每段 WAV 按帧写进主机端适配', async () => {
+  const gateway = await startGateway();
+  const dir = mkdtempSync(join(tmpdir(), 'tts-world-'));
+  const stub = join(dir, 'stub_relay.py');
+  const seen = join(dir, 'frames.log');
+  writeFileSync(stub, [
+    'import sys, json, hashlib',
+    `out = open(${JSON.stringify(seen)}, "a", encoding="utf-8")`,
+    'seq = 0',
+    'while True:',
+    '    head = sys.stdin.buffer.read(4)',
+    '    if not head: break',
+    '    n = int.from_bytes(head, "little")',
+    '    wav = sys.stdin.buffer.read(n)',
+    '    out.write(json.dumps({"seq": seq, "bytes": len(wav), "sha256": hashlib.sha256(wav).hexdigest()}) + "\\n")',
+    '    out.flush()',
+    '    print(json.dumps({"seq": seq, "ok": True, "bytes": len(wav)}), flush=True)',
+    '    seq += 1',
+    'out.close()',
+  ].join('\n'), 'utf8');
+
+  const world = new TtsStreamWorld({
+    cfg: {
+      baseUrl: `http://127.0.0.1:${gateway.port}`,
+      play: false,
+      duckEnabled: true,
+      duckRelay: stub,
+      duckPython: process.platform === 'win32' ? 'python' : 'python3',
+    },
+    dataDir: dir,
+    secret: () => '',
+    onPlay: () => {},
+  });
+
+  try {
+    await world.start(fakeHost([]));
+    await world.speak('鸭甲，鸭乙。', { origin: 'tool' });
+    for (let i = 0; i < 50 && !(existsSync(seen) && readFileSync(seen, 'utf8').trim().split('\n').length >= 2); i += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    const lines = readFileSync(seen, 'utf8').trim().split('\n').map((line) => JSON.parse(line));
+    assert.equal(lines.length, 2, '两段都应写进适配进程');
+    assert.deepEqual(lines.map((line) => line.seq), [0, 1]);
+    assert.ok(lines.every((line) => line.bytes > 0));
+  } finally {
+    await world.stop();
+    await gateway.close();
+    cleanup(dir);
   }
 });
 
@@ -142,6 +205,7 @@ test('新一轮顶掉旧一轮：旧一轮的后续段不再送播放器', async
   } finally {
     await world.stop();
     await gateway.close();
-    rmSync(dir, { recursive: true, force: true });
+    cleanup(dir);
   }
 });
+

@@ -30,8 +30,8 @@ if (-not (Test-Path -LiteralPath $venvPython)) {
 }
 
 $env:GPTSOVITS_HOME = (Resolve-Path -LiteralPath $GptSovitsHome).Path
-$env:GATEWAY_HOST = $BindHost
-$env:GATEWAY_PORT = [string]$Port
+$env:TTS_BIND_HOST = $BindHost
+$env:TTS_BIND_PORT = [string]$Port
 
 if ($Background) {
     $logDir = Join-Path $repoRoot ".run"

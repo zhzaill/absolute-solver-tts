@@ -40,4 +40,4 @@ if ($LASTEXITCODE -ne 0) {
 }
 
 Write-Host "Gateway environment ready: $venvDir"
-Write-Host "Next: set GPTSOVITS_HOME and GATEWAY_API_KEY, then run scripts\start-gateway.ps1"
+Write-Host "Next: set GPTSOVITS_HOME, run scripts\start-gateway.ps1, then create a client key in /admin."

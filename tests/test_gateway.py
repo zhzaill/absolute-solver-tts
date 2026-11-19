@@ -1,15 +1,24 @@
 from __future__ import annotations
 
+import io
 import json
-import os
 import tempfile
 import unittest
+import wave
 from pathlib import Path
 from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 
 import gateway.gateway as gateway
+
+
+def pcm_wav(sample: bytes) -> bytes:
+    output = io.BytesIO()
+    with wave.open(output, "wb") as wav:
+        wav.setparams((1, 2, 16000, 0, "NONE", "not compressed"))
+        wav.writeframes(sample * 16000)
+    return output.getvalue()
 
 
 class GatewayTestCase(unittest.TestCase):
@@ -28,43 +37,27 @@ class GatewayTestCase(unittest.TestCase):
         (cls.root / "SoVITS_weights").mkdir()
         (cls.root / "SoVITS_weights" / "voice.pth").write_bytes(b"fixture")
 
-        cls.old_env = {
-            key: os.environ.get(key)
-            for key in (
-                "GPTSOVITS_HOME",
-                "GATEWAY_API_KEY",
-                "GATEWAY_STATE_FILE",
-                "GATEWAY_HOST",
-            )
-        }
-        os.environ["GPTSOVITS_HOME"] = str(cls.root)
-        os.environ["GATEWAY_API_KEY"] = "unit" + "-auth"
-        os.environ["GATEWAY_STATE_FILE"] = str(cls.root / "gateway_state.json")
-        os.environ["GATEWAY_HOST"] = "127.0.0.1"
-
-        gateway.INSTALL = cls.root
-        gateway.STATE_FILE = cls.root / "gateway_state.json"
-        gateway.API_KEY = "unit" + "-auth"
-        gateway.STATE_FILE.unlink(missing_ok=True)
-        cls.client = TestClient(gateway.app)
         cls.headers = {"Authorization": "Bearer unit-auth"}
 
     @classmethod
     def tearDownClass(cls) -> None:
-        for key, value in cls.old_env.items():
-            if value is None:
-                os.environ.pop(key, None)
-            else:
-                os.environ[key] = value
         cls.temp.cleanup()
 
     def setUp(self) -> None:
-        gateway.STATE_FILE.unlink(missing_ok=True)
+        config_path = self.root / "config.json"
+        self.enterContext(patch.multiple(gateway, INSTALL=self.root, CONFIG_PATH=config_path,
+                                         _CONF={}, _CONF_MTIME=-1.0, _KEY_TOUCH={}))
+        cfg = gateway._config_template()
+        cfg["auth"]["cookie_secret"] = "test-session-secret"
+        cfg["keys"] = [{"id": "test", "key": "unit-auth", "enabled": True}]
+        gateway.save_config(cfg)
+        self.admin_headers = {"X-Admin-Token": gateway.issue_session(cfg)[0]}
+        self.client = self.enterContext(TestClient(gateway.app))
 
     def register_voice(self) -> None:
         response = self.client.post(
-            "/v1/audio/voices",
-            headers=self.headers,
+            "/admin/api/voices",
+            headers=self.admin_headers,
             json={
                 "id": "local_voice",
                 "gpt": "GPT_weights/voice.ckpt",
@@ -92,8 +85,8 @@ class GatewayTestCase(unittest.TestCase):
 
     def test_reference_path_escape_is_rejected(self) -> None:
         response = self.client.post(
-            "/v1/audio/voices",
-            headers=self.headers,
+            "/admin/api/voices",
+            headers=self.admin_headers,
             json={
                 "id": "bad",
                 "ref_audio": "../outside.wav",
@@ -111,7 +104,7 @@ class GatewayTestCase(unittest.TestCase):
 
         class Upstream:
             status_code = 200
-            content = b"RIFF....WAVE"
+            content = pcm_wav(b"\x20\x00")
             text = ""
 
         def fake_post(url: str, json: dict, timeout: float) -> Upstream:
@@ -134,9 +127,23 @@ class GatewayTestCase(unittest.TestCase):
                 )
 
         self.assertEqual(response.status_code, 200, response.text)
-        self.assertEqual(captured["url"], f"http://127.0.0.1:{gateway.UPSTREAM_PORT}/tts")
+        self.assertEqual(captured["url"], "http://127.0.0.1:9880/tts")
         self.assertEqual(captured["json"]["text_lang"], "ja")
         self.assertEqual(captured["json"]["prompt_lang"], "zh")
+
+    def test_refuses_successful_but_unusable_wav(self) -> None:
+        self.register_voice()
+        payload = {"input": "Test", "voice": "local_voice", "response_format": "wav"}
+        silent = pcm_wav(b"\x00\x00")
+        truncated = pcm_wav(b"\x20\x00")[:-2]
+        for invalid in (b"", b"invalid WAV", silent, truncated):
+            with self.subTest(size=len(invalid)), patch.object(
+                gateway, "_call_upstream", return_value=type("Upstream", (), {"status_code": 200, "content": invalid})()
+            ):
+                client = self.client.post("/v1/audio/speech", headers=self.headers, json=payload)
+                admin = self.client.post("/admin/api/test", headers=self.admin_headers, json=payload)
+                self.assertEqual(client.status_code, 502)
+                self.assertEqual(admin.status_code, 502)
 
     def test_upstream_load_rejects_path_escape(self) -> None:
         class Alive:
@@ -144,16 +151,16 @@ class GatewayTestCase(unittest.TestCase):
 
         with patch.object(gateway, "upstream_alive", return_value=True):
             response = self.client.post(
-                "/admin/upstream/load",
-                headers=self.headers,
+                "/admin/api/upstream/load",
+                headers=self.admin_headers,
                 json={"gpt": "../outside.ckpt"},
             )
         self.assertEqual(response.status_code, 400)
 
     def test_state_is_json_serializable(self) -> None:
         self.register_voice()
-        state = json.loads(gateway.STATE_FILE.read_text(encoding="utf-8"))
-        self.assertEqual(state["default_voice"], "local_voice")
+        state = json.loads(gateway.CONFIG_PATH.read_text(encoding="utf-8"))
+        self.assertEqual(state["defaults"]["voice"], "local_voice")
         self.assertIn("local_voice", state["voices"])
 
 

@@ -50,6 +50,12 @@ export const DEFAULTS = {
   keep: 200,
   // 单次合成上限；超时按失败处理，不挂住队列
   timeoutMs: 120000,
+  // 鸭身：把每段 WAV 经同一套帧协议交给主机端适配（scripts/duck_relay.py）
+  duckEnabled: false,
+  duckPython: 'python',
+  duckTarget: '',
+  duckDevice: '',
+  duckRelay: '',
 };
 
 const msg = (err) => (err instanceof Error ? err.message : String(err));
@@ -94,6 +100,8 @@ export class TtsStreamWorld {
   #lastError = '';
   #lastTurn = null;
   #segments = [];
+  #duck = null;
+  #duckState = 'off';
 
   constructor(opts = {}) {
     this.cfg = opts.cfg ?? { ...DEFAULTS };
@@ -200,6 +208,7 @@ export class TtsStreamWorld {
     writeFileSync(path, wav);
     this.#segments.push({ path, at: Date.now() });
     this.#pruneSegments();
+    this.#writeDuck(wav);
     if (this.onPlay) {
       this.onPlay(path, wav);
       return;
@@ -224,6 +233,74 @@ export class TtsStreamWorld {
       } catch {
         /* 文件被占着就算了 */
       }
+    }
+  }
+
+  // ---------------------------------------------------------------- 鸭身
+
+  /**
+   * 主机端播放适配：`scripts/duck_relay.py` 收同一套帧，经一条 SSH 会话送到板端，
+   * 逐段回执。鸭子的音量、设备、待播量都在这一层，World 只负责按序写帧。
+   */
+  #ensureDuck() {
+    if (this.#duck) return this.#duck;
+    const relay = this.#str('duckRelay') || fileURLToPath(new URL('../../../scripts/duck_relay.py', import.meta.url));
+    const args = [relay];
+    const target = this.#str('duckTarget');
+    if (target) args.push('--target', target);
+    else args.push('--local');
+    const device = this.#str('duckDevice');
+    if (device) args.push('--device', device);
+    const python = this.#str('duckPython') || 'python';
+    const child = spawn(python, ['-u', ...args], { stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true });
+    let buffer = '';
+    child.stdout.setEncoding('utf8');
+    child.stdout.on('data', (chunk) => {
+      buffer += chunk;
+      let cut = buffer.indexOf('\n');
+      while (cut >= 0) {
+        const line = buffer.slice(0, cut).trim();
+        buffer = buffer.slice(cut + 1);
+        cut = buffer.indexOf('\n');
+        if (!line) continue;
+        try {
+          const receipt = JSON.parse(line);
+          if (receipt.summary) this.#duckState = `上次会话 ${receipt.summary.ok}/${receipt.summary.sent}`;
+          else if (receipt.ok === false) this.#duckState = `段 ${receipt.seq} 失败：${receipt.error ?? ''}`;
+        } catch {
+          this.#duckState = `回执不是 JSON：${line.slice(0, 80)}`;
+        }
+      }
+    });
+    child.stderr.setEncoding('utf8');
+    child.stderr.on('data', (chunk) => {
+      const text = String(chunk).trim();
+      if (text) this.#host?.log?.warn?.('流式语音：鸭身适配', { text: text.slice(0, 200) });
+    });
+    child.on('exit', (code) => {
+      if (this.#duck === child) {
+        this.#duck = null;
+        this.#duckState = `适配进程退出（${code}）`;
+      }
+    });
+    child.on('error', (error) => {
+      this.#duckState = `起不来：${msg(error)}`;
+      this.#duck = null;
+    });
+    this.#duck = child;
+    this.#duckState = 'running';
+    return child;
+  }
+
+  #writeDuck(wav) {
+    if (!this.#bool('duckEnabled')) return;
+    const duck = this.#ensureDuck();
+    const size = Buffer.alloc(4);
+    size.writeUInt32LE(wav.length, 0);
+    try {
+      duck.stdin.write(Buffer.concat([size, wav]));
+    } catch (error) {
+      this.#duckState = `写不进适配进程：${msg(error)}`;
     }
   }
 
@@ -367,6 +444,7 @@ export class TtsStreamWorld {
       bits.push(`上一段 ${this.#lastTurn.segments} 段 / 首段 ${this.#lastTurn.firstAudioMs ?? '-'} ms`);
     }
     if (this.#lastError) bits.push(`最近错误：${this.#lastError.slice(0, 120)}`);
+    if (this.#bool('duckEnabled')) bits.push(`鸭身 ${this.#duckState}`);
     return bits.join(' · ');
   }
 
@@ -425,6 +503,16 @@ export class TtsStreamWorld {
     this.#jobEpoch += 1;
     this.#abort?.abort();
     this.#abort = null;
+    if (this.#duck) {
+      try {
+        this.#duck.stdin.end();
+      } catch {
+        /* ignore */
+      }
+      this.#duck.kill();
+      this.#duck = null;
+      this.#duckState = 'off';
+    }
     if (this.#player) {
       try {
         this.#player.stdin.end();
@@ -464,6 +552,11 @@ export function configGroup() {
         [`${K}.laterSteps`]: num('后续步数', '后续句的 CFM 步数', 1, 64),
         [`${K}.speed`]: { type: 'number', title: '后续语速', 'x-hot': true },
         [`${K}.play`]: { type: 'boolean', title: '本机播放', description: '关掉就只合成落盘、不出声' },
+        [`${K}.duckEnabled`]: { type: 'boolean', title: '转给 MicroDuck', description: '每段 WAV 交给主机端适配，经 SSH 送板端 aplay' },
+        [`${K}.duckTarget`]: str('鸭身 SSH', '如 radxa@microduck.local；留空则本机直跑（调试用）'),
+        [`${K}.duckDevice`]: str('ALSA 设备', '如 plughw:CARD=Speak,DEV=0；留空用默认设备'),
+        [`${K}.duckPython`]: str('Python', '跑主机端适配的解释器，默认 python'),
+        [`${K}.duckRelay`]: str('适配脚本', '留空用仓库里的 scripts/duck_relay.py'),
         [`${K}.keep`]: num('保留段数', '超出后删最旧的', 1, 5000),
         [`${K}.timeoutMs`]: num('超时', '单次合成的上限（毫秒）', 5000, 900000, { 'x-suffix': 'ms' }),
       },

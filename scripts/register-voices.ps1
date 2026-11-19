@@ -3,7 +3,7 @@ param(
     [Parameter(Mandatory = $true)]
     [string]$Manifest,
     [string]$GatewayBaseUrl = "http://127.0.0.1:18080",
-    [string]$ApiKey = $env:GATEWAY_API_KEY
+    [string]$AdminToken = $env:TTS_ADMIN_TOKEN
 )
 
 $ErrorActionPreference = "Stop"
@@ -13,10 +13,10 @@ if ($null -eq $document.voices) {
     throw "Manifest must contain a voices object."
 }
 
-$headers = @{}
-if ($ApiKey) {
-    $headers.Authorization = "Bearer $ApiKey"
+if (-not $AdminToken) {
+    throw "Pass -AdminToken or set TTS_ADMIN_TOKEN to a gateway administrator session token."
 }
+$headers = @{ 'X-Admin-Token' = $AdminToken }
 
 function Invoke-GatewayJson {
     param(
@@ -50,14 +50,15 @@ foreach ($property in $document.voices.PSObject.Properties) {
         text_lang = $(if ($voice.text_lang) { $voice.text_lang } else { $voice.ref_lang })
         speed = $(if ($null -ne $voice.speed) { [double]$voice.speed } else { 1.0 })
     }
-    Invoke-GatewayJson -Method "POST" -Path "/v1/audio/voices" -Payload $payload | Out-Null
+    if ($null -ne $voice.auto_text_lang) { $payload.auto_text_lang = [bool]$voice.auto_text_lang }
+    Invoke-GatewayJson -Method "POST" -Path "/admin/api/voices" -Payload $payload | Out-Null
     $registered += $voiceId
 }
 
 if ($document.default) {
     Invoke-GatewayJson `
         -Method "POST" `
-        -Path "/v1/audio/voices/default" `
+        -Path "/admin/api/voices/default" `
         -Payload @{ id = [string]$document.default } | Out-Null
 }
 
